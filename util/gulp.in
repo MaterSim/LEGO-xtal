@@ -1,0 +1,19 @@
+opti stress conp conjugate 
+cell
+    2.460000    2.460000    3.557395   90.000000   90.000000  120.000000
+
+fractional
+C        0.333333     0.666667     0.500000 core 
+
+space
+191
+
+origin
+0 0 0
+
+Species
+C    core C   
+
+library reaxff
+ewald 10.0
+maxcycle 1000
