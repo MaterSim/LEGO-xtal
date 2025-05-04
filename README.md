@@ -5,9 +5,9 @@ LEGO-Cryst (Local Environment Geometry-Oriented Crystal Generator) is designed f
 The LEGO-Cryst workflow is illustrated below using sp²-hybridized carbon structures as an example:
 
 1.  **Training Data Collection and Augmentation:**
-    *   ** Data Selection:** Curate a dataset of known structures (e.g., 140 sp² carbon structures from the SACADA database).
-    *   ** Crystal Representation:** Describe each structure using an irreducible crystal representation, encoding space group number, cell parameters, and Wyckoff site information (typically resulting in a ~40-column feature vector).
-    *   ** Symmetry-Based Data Augmentation:** Generate alternative representations based on group-subgroup relationships to maximize the utility of crystal symmetry. This allows the model to learn from diverse symmetry perspectives and ensures sufficient data for training.
+    *   **Data Selection:** Curate a dataset of known structures (e.g., 140 sp² carbon structures from the SACADA database).
+    *   **Crystal Representation:** Describe each structure using an irreducible crystal representation, encoding space group number, cell parameters, and Wyckoff site information (typically resulting in a ~40-column feature vector).
+    *   **Symmetry-Based Data Augmentation:** Generate alternative representations based on group-subgroup relationships to maximize the utility of crystal symmetry. This allows the model to learn from diverse symmetry perspectives and ensures sufficient data for training.
 
 2.  **Featurization:**
     *   In the augmented tabular dataset (e.g., ~60,000 rows × 40 columns), transform each row to an extended feature representation using techniques like one-hot encoding and Gaussian mixture models to enhance model learning.
