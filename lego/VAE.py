@@ -9,8 +9,8 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from data_transformer import DataTransformer
-from base import BaseSynthesizer, random_state
+from .data_transformer import DataTransformer
+from .base import BaseSynthesizer, random_state
 import matplotlib.pyplot as plt
 
 

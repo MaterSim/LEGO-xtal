@@ -1,4 +1,4 @@
-import os, argparse
+import argparse
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -8,13 +8,12 @@ from pyxtal.db import database_topology
 
 if __name__ == "__main__":
     # Create the parser
-    parser = argparse.ArgumentParser(description="Gen Models.")
-
+    parser = argparse.ArgumentParser(description="Energy Calculation.")
     # Add arguments
     parser.add_argument('--db', '-d', dest='db', type=str,
                         help='database name')
     parser.add_argument('--ncpu', '-n', dest='ncpu', type=int, default=1,
-                        help='N_cpu for parallel computation')
+                        help='ncpu for parallel computation')
     parser.add_argument('--code', '-c', dest='code', default='MACE',
                         help='GULP, MACE, VASP')
     parser.add_argument('--min', dest='min', type=int, default=1,
@@ -31,7 +30,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     folder = args.db.split('/')[0]
-    db = database_topology(args.db, log_file=folder+'/'+args.code+'.log')
+    db = database_topology(args.db, log_file=folder + '/' + args.code + '.log')
 
     db.update_row_energy(args.code,
                          N_atoms=(args.min, args.max),
@@ -40,7 +39,7 @@ if __name__ == "__main__":
                          overwrite=True,
                          use_relaxed=args.code.lower()+'_relaxed')
 
-    print(f"Complete MACE in {args.db} with {(time()-t0)/60:.1f} minutes")
+    print(f"Finish {args.code}@{args.db} in {(time()-t0)/60:.1f} minutes")
 
     if args.metric:
         attribute = args.code.lower() + '_energy'

@@ -1,28 +1,26 @@
 import os
 import argparse
-import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from time import time
 from multiprocessing import Pool
 from functools import partial
 from pyxtal import pyxtal
-from pyxtal.lego.builder import mof_builder
+from pyxtal.lego.builder import builder
 from pyxtal.db import database_topology
 
 def process_rep(rep, discrete, discrete_cell, discrete_res):
     xtal = pyxtal()
-
     # Remove the extra energy and labels
     mod = (len(rep) - 7) % 4
     if mod > 0: rep = rep[:-mod]
     try:
         xtal.from_tabular_representation(rep,
-                                        normalize=False,
-                                        discrete=discrete,
-                                        discrete_cell=discrete_cell,
-                                        N_grids=discrete_res)
-       if xtal.valid and len(xtal.atom_sites) > 0:
+                                         normalize=False,
+                                         discrete=discrete,
+                                         discrete_cell=discrete_cell,
+                                         N_grids=discrete_res)
+        if xtal.valid and len(xtal.atom_sites) > 0:
            return rep, sum(xtal.numIons)
     except:
         print(f"Failed to process: {rep}")
@@ -30,15 +28,14 @@ def process_rep(rep, discrete, discrete_cell, discrete_res):
 
 if __name__ == "__main__":
     # Create the parser
-    parser = argparse.ArgumentParser(description="Generative Models.")
-    parser.add_argument('--ncpu', '-n', dest='ncpu', type=int, default=1,
+    parser = argparse.ArgumentParser(description="Relaxation code.")
+    parser.add_argument('--ncpu', type=int, default=1,
                         help='N_cpu for parallel computation')
-    parser.add_argument('--csv', '-c', dest='csv',
-                        help='csv file path')
-    parser.add_argument('--begin', '-b', dest='begin', type=int, default=0,
-                        help='end count')
-    parser.add_argument('--end', '-e', dest='end', type=int, default=-1,
-                        help='end count')
+    parser.add_argument('--csv', help='csv file path')
+    parser.add_argument('--begin', type=int, default=0, help='end count')
+    parser.add_argument('--end', type=int, default=-1, help='end count')
+    parser.add_argument('--source', default='data/source/sp2_sacada.db', 
+                        help='path to source database')
 
     # Check if use_mpi is invoked
     use_mpi = "OMPI_COMM_WORLD_SIZE" in os.environ or "SLURM_MPI_TYPE" in os.environ
@@ -123,20 +120,19 @@ if __name__ == "__main__":
     print(f"Rank-{rank} receives {N1} structures for optimization ")
 
     # 2. Setup builder and run optimization
-    builder = mof_builder(['C'], [1], rank=rank, prefix=f'{name}/mof')
-    builder.set_descriptor_calculator(mykwargs={'rcut': 2.1})
-    builder.set_reference_enviroments(cif_file)
-    builder.set_criteria(CN={'C': [3]})
-    xtals = builder.optimize_reps(reps, ncpu=ncpu,
-                                  minimizers=[('Nelder-Mead', 100),
-                                              ('L-BFGS-B', 400),
-                                              ('L-BFGS-B', 200)],
-                                  N_grids=discrete_res)
+    bu = builder(['C'], [1], rank=rank, prefix=f'{name}/mof')
+    bu.set_descriptor_calculator(mykwargs={'rcut': 2.1})
+    bu.set_reference_enviroments(cif_file)
+    bu.set_criteria(CN={'C': [3]})
+    xtals = bu.optimize_reps(reps, ncpu=ncpu,
+                             minimizers=[('Nelder-Mead', 100),
+                                         ('L-BFGS-B', 400),
+                                         ('L-BFGS-B', 200)],
+                             N_grids=discrete_res)
     N2 = len(xtals)
-    builder.db.update_row_energy('GULP', ncpu=ncpu,
-                                 calc_folder=f"{name}/gulp_{rank}")
-
-    N3 = builder.db.get_db_unique(f'{name}/unique_{rank}.db')
+    bu.db.update_row_energy('GULP', ncpu=ncpu, 
+                            calc_folder=f"{name}/gulp_{rank}")
+    N3 = bu.db.get_db_unique(f'{name}/unique_{rank}.db')
     t = int((time()-t0)/60)
     print(f'R-{rank} N0/N1/N2/N3: {N0}/{N1}/{N2}/{N3} in {t} m/{ncpu} cores')
     local_data = (N0, N1, N2, N3)
@@ -150,7 +146,6 @@ if __name__ == "__main__":
             N1 = sum(result[1] for result in all_data)
             N2 = sum(result[2] for result in all_data)
 
-            from pyxtal.db import database_topology
             db = database_topology(f'{name}/unique_0.db')
             for i in range(1, size):
                 db.add_strucs_from_db(f'{name}/unique_{i}.db')
@@ -160,8 +155,7 @@ if __name__ == "__main__":
 
     # 4. Write metrics
     if rank == 0:
-        sp2 = '../../dataset/dbs/sp2_sacada.db'
-        db = database_topology(sp2, log_file=f'{name}/sp2.log')
+        db = database_topology(args.source, log_file=f'{name}/sp2.log')
         overlaps = db.check_overlap(f'{name}/final.db')
         N4 = len(overlaps)
 
