@@ -2,8 +2,7 @@ from pyxtal.db import database_topology
 from pyxtal import pyxtal
 import argparse
 import os
-import ast
-import numpy as np
+from ast import literal_eval
 
 if __name__ == "__main__":
     # Create the parser
@@ -27,7 +26,7 @@ if __name__ == "__main__":
 
     xtal = pyxtal()
     for row in db.db.select():
-        ps, spg, wps = row.pearson_symbol, row.space_group_number, ast.literal_eval(row.wps)
+        ps, spg, wps = row.pearson_symbol, row.space_group_number, literal_eval(row.wps)
         if hasattr(row, name):
             eng = getattr(row, name)
             den = row.density
