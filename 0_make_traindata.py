@@ -62,17 +62,16 @@ def make_csv(total_reps, energy, label, discrete, discrete_cell, N_wp, tag):
     df.columns = column_names # Assign correct column names
 
     # Determine output filename based on discretization flags
+    filename = f"data/train/{tag}"
     if discrete:
-        filename = (
-            f"data/sample/train-{tag}-discell.csv"
-            if discrete_cell
-            else f"data/sample/train-{tag}-dis.csv"
-        )
+        if discrete_cell:
+            filename += '-discell.csv'
+        else:
+            filename += '-dis.csv'
     else:
-        filename = f"data/sample/train-{tag}.csv"
+        filename += ".csv"
 
     # Create directory if it doesn't exist
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
     df.to_csv(filename, index=False)
     print(f"Data saved to {filename}")
 

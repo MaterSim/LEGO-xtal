@@ -10,24 +10,21 @@ if __name__ == "__main__":
     # Create the parser
     parser = argparse.ArgumentParser(description="Energy Calculation.")
     # Add arguments
-    parser.add_argument('--db', '-d', dest='db', type=str,
-                        help='database name')
-    parser.add_argument('--ncpu', '-n', dest='ncpu', type=int, default=1,
+    parser.add_argument('--db', help='database name')
+    parser.add_argument('--ncpu', type=int, default=1,
                         help='ncpu for parallel computation')
-    parser.add_argument('--code', '-c', dest='code', default='MACE',
+    parser.add_argument('--code', default='MACE',
                         help='GULP, MACE, VASP')
-    parser.add_argument('--min', dest='min', type=int, default=1,
+    parser.add_argument('--min', type=int, default=1,
                         help='min number of atoms')
-    parser.add_argument('--max', dest='max', type=int, default=1000,
+    parser.add_argument('--max', type=int, default=1000,
                         help='max number of atoms')
-    parser.add_argument('--step', '-s', dest='step', type=int, default=200,
+    parser.add_argument('--step', type=int, default=200,
                         help='relaxation steps')
-    parser.add_argument("--metric", dest='metric', action='store_true',
+    parser.add_argument("--metric", action='store_true',
                         default=False, help="write metric")
 
-
     t0 = time()
-
     args = parser.parse_args()
     folder = args.db.split('/')[0]
     db = database_topology(args.db, log_file=folder + '/' + args.code + '.log')
