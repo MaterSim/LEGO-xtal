@@ -11,7 +11,6 @@ from torch import optim
 from torch.nn import BatchNorm1d, Dropout, LeakyReLU, Linear, Module, ReLU, Sequential, functional
 from tqdm import tqdm
 
-from .data_sampler import DataSampler
 from .data_transformer import DataTransformer
 from .base import BaseSynthesizer, random_state
 
@@ -58,7 +57,7 @@ class Discriminator(Module):
 
     def forward(self, input_):
         """Apply the Discriminator to the `input_`."""
-        assert input_.size()[0] % self.pac == 0
+        assert input_.shape[0] % self.pac == 0
         return self.seq(input_.view(-1, self.pacdim))
 
 
@@ -242,55 +241,6 @@ class CTGAN(BaseSynthesizer):
 
         return torch.cat(data_t, dim=1)
 
-    def _cond_loss(self, data, c, m):
-        """Compute the cross entropy loss on the fixed discrete column."""
-        loss = []
-        st = 0
-        st_c = 0
-        for column_info in self._transformer.output_info_list:
-            for span_info in column_info:
-                if len(column_info) != 1 or span_info.activation_fn != 'softmax':
-                    # not discrete column
-                    st += span_info.dim
-                else:
-                    ed = st + span_info.dim
-                    ed_c = st_c + span_info.dim
-                    tmp = functional.cross_entropy(
-                        data[:, st:ed], torch.argmax(c[:, st_c:ed_c], dim=1), reduction='none'
-                    )
-                    loss.append(tmp)
-                    st = ed
-                    st_c = ed_c
-
-        loss = torch.stack(loss, dim=1)  # noqa: PD013
-
-        return (loss * m).sum() / data.size()[0]
-
-    def _validate_discrete_columns(self, train_data, discrete_columns):
-        """Check whether ``discrete_columns`` exists in ``train_data``.
-
-        Args:
-            train_data (numpy.ndarray or pandas.DataFrame):
-                Training Data. It must be a 2-dimensional numpy array or a pandas.DataFrame.
-            discrete_columns (list-like):
-                List of discrete columns to be used to generate the Conditional
-                Vector. If ``train_data`` is a Numpy array, this list should
-                contain the integer indices of the columns. Otherwise, if it is
-                a ``pandas.DataFrame``, this list should contain the column names.
-        """
-        if isinstance(train_data, pd.DataFrame):
-            invalid_columns = set(discrete_columns) - set(train_data.columns)
-        elif isinstance(train_data, np.ndarray):
-            invalid_columns = []
-            for column in discrete_columns:
-                if column < 0 or column >= train_data.shape[1]:
-                    invalid_columns.append(column)
-        else:
-            raise TypeError('``train_data`` should be either pd.DataFrame or np.array.')
-
-        if invalid_columns:
-            raise ValueError(f'Invalid columns found: {invalid_columns}')
-
 
 
 
@@ -307,36 +257,25 @@ class CTGAN(BaseSynthesizer):
                 contain the integer indices of the columns. Otherwise, if it is
                 a ``pandas.DataFrame``, this list should contain the column names.
         """
-        self._validate_discrete_columns(train_data, discrete_columns)
-
-        if epochs is None:
-            epochs = self._epochs
-        else:
-            warnings.warn(
-                (
-                    '`epochs` argument in `fit` method has been deprecated and will be removed '
-                    'in a future version. Please pass `epochs` to the constructor instead'
-                ),
-                DeprecationWarning,
-            )
 
         self._transformer = DataTransformer()
         self._transformer.fit(train_data, discrete_columns)
-
+        epochs = self._epochs
         train_data = self._transformer.transform(train_data)
+        train_data = torch.from_numpy(train_data.astype('float32')).to(self._device)
 
-        self._data_sampler = DataSampler(
-            train_data, self._transformer.output_info_list, self._log_frequency
-        )
+        data_len = len(train_data)
+
+
 
         data_dim = self._transformer.output_dimensions
 
         self._generator = Generator(
-            self._embedding_dim + self._data_sampler.dim_cond_vec(), self._generator_dim, data_dim
+            self._embedding_dim , self._generator_dim, data_dim
         ).to(self._device)
 
         discriminator = Discriminator(
-            data_dim + self._data_sampler.dim_cond_vec(), self._discriminator_dim, pac=self.pac
+            data_dim , self._discriminator_dim, pac=self.pac
         ).to(self._device)
 
         optimizerG = optim.Adam(
@@ -363,85 +302,45 @@ class CTGAN(BaseSynthesizer):
             description = 'Gen. ({gen:.2f}) | Discrim. ({dis:.2f})'
             epoch_iterator.set_description(description.format(gen=0, dis=0))
 
-        steps_per_epoch = max(len(train_data) // self._batch_size, 1)
+        steps_per_epoch = max(data_len // self._batch_size, 1)
+
         for i in epoch_iterator:
             for id_ in range(steps_per_epoch):
                 for n in range(self._discriminator_steps):
                     fakez = torch.normal(mean=mean, std=std)
-
-                    condvec = self._data_sampler.sample_condvec(self._batch_size)
-                    if condvec is None:
-                        c1, m1, col, opt = None, None, None, None
-                        real = self._data_sampler.sample_data(
-                            train_data, self._batch_size, col, opt
-                        )
-                    else:
-                        c1, m1, col, opt = condvec
-                        c1 = torch.from_numpy(c1).to(self._device)
-                        m1 = torch.from_numpy(m1).to(self._device)
-                        fakez = torch.cat([fakez, c1], dim=1)
-
-                        perm = np.arange(self._batch_size)
-                        np.random.shuffle(perm)
-                        real = self._data_sampler.sample_data(
-                            train_data, self._batch_size, col[perm], opt[perm]
-                        )
-                        c2 = c1[perm]
-
+                    idx = torch.randint(0, data_len, (self._batch_size,))
+                    real = train_data[idx]
+                    fakez = torch.normal(mean=mean, std=std)
                     fake = self._generator(fakez)
                     fakeact = self._apply_activate(fake)
+                    # Train with real data
+                    y_real = discriminator(real)
+                    
+                    # Train with fake data
+                    y_fake = discriminator(fakeact)
 
-                    real = torch.from_numpy(real.astype('float32')).to(self._device)
-
-                    if c1 is not None:
-                        fake_cat = torch.cat([fakeact, c1], dim=1)
-                        real_cat = torch.cat([real, c2], dim=1)
-                    else:
-                        real_cat = real
-                        fake_cat = fakeact
-
-                    y_fake = discriminator(fake_cat)
-                    y_real = discriminator(real_cat)
-
+                    # Compute WGAN loss with gradient penalty
                     pen = discriminator.calc_gradient_penalty(
-                        real_cat, fake_cat, self._device, self.pac
+                        real, fakeact, self._device, self.pac
                     )
-                    loss_d = -(torch.mean(y_real) - torch.mean(y_fake))
+                    loss_d = -(torch.mean(y_real) - torch.mean(y_fake)) + pen
 
                     optimizerD.zero_grad(set_to_none=False)
-                    pen.backward(retain_graph=True)
                     loss_d.backward()
                     optimizerD.step()
 
+                # Train Generator
                 fakez = torch.normal(mean=mean, std=std)
-                condvec = self._data_sampler.sample_condvec(self._batch_size)
-
-                if condvec is None:
-                    c1, m1, col, opt = None, None, None, None
-                else:
-                    c1, m1, col, opt = condvec
-                    c1 = torch.from_numpy(c1).to(self._device)
-                    m1 = torch.from_numpy(m1).to(self._device)
-                    fakez = torch.cat([fakez, c1], dim=1)
-
                 fake = self._generator(fakez)
                 fakeact = self._apply_activate(fake)
 
-                if c1 is not None:
-                    y_fake = discriminator(torch.cat([fakeact, c1], dim=1))
-                else:
-                    y_fake = discriminator(fakeact)
-
-                if condvec is None:
-                    cross_entropy = 0
-                else:
-                    cross_entropy = self._cond_loss(fake, c1, m1)
-
-                loss_g = -torch.mean(y_fake) + cross_entropy
+                y_fake = discriminator(fakeact)
+                loss_g = -torch.mean(y_fake)
 
                 optimizerG.zero_grad(set_to_none=False)
                 loss_g.backward()
                 optimizerG.step()
+
 
             generator_loss = loss_g.detach().cpu().item()
             discriminator_loss = loss_d.detach().cpu().item()
@@ -464,52 +363,22 @@ class CTGAN(BaseSynthesizer):
                 )
 
     @random_state
-    def sample(self, samples, condition_column=None, condition_value=None):
+    def sample(self, samples):
         """Sample data similar to the training data.
-
-        Choosing a condition_column and condition_value will increase the probability of the
-        discrete condition_value happening in the condition_column.
 
         Args:
             samples (int):
                 Number of rows to sample.
-            condition_column (string):
-                Name of a discrete column.
-            condition_value (string):
-                Name of the category in the condition_column which we wish to increase the
-                probability of happening.
 
         Returns:
             numpy.ndarray or pandas.DataFrame
         """
-        if condition_column is not None and condition_value is not None:
-            condition_info = self._transformer.convert_column_name_value_to_id(
-                condition_column, condition_value
-            )
-            global_condition_vec = self._data_sampler.generate_cond_from_condition_column_info(
-                condition_info, self._batch_size
-            )
-        else:
-            global_condition_vec = None
-
         steps = samples // self._batch_size + 1
         data = []
-        for i in range(steps):
+        for _ in range(steps):
             mean = torch.zeros(self._batch_size, self._embedding_dim)
             std = mean + 1
             fakez = torch.normal(mean=mean, std=std).to(self._device)
-
-            if global_condition_vec is not None:
-                condvec = global_condition_vec.copy()
-            else:
-                condvec = self._data_sampler.sample_original_condvec(self._batch_size)
-
-            if condvec is None:
-                pass
-            else:
-                c1 = condvec
-                c1 = torch.from_numpy(c1).to(self._device)
-                fakez = torch.cat([fakez, c1], dim=1)
 
             fake = self._generator(fakez)
             fakeact = self._apply_activate(fake)
