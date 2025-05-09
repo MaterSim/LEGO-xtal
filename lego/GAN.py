@@ -3,16 +3,17 @@ GAN module, inspired by the CTGAN paper
 """
 
 import warnings
-
+import joblib
 import numpy as np
 import pandas as pd
 import torch
 from torch import optim
 from torch.nn import BatchNorm1d, Dropout, LeakyReLU, Linear, Module, ReLU, Sequential, functional
 from tqdm import tqdm
-
+import os
 from .data_transformer import DataTransformer
 from .base import BaseSynthesizer, random_state
+import matplotlib.pyplot as plt
 
 
 class Discriminator(Module):
@@ -242,7 +243,45 @@ class CTGAN(BaseSynthesizer):
         return torch.cat(data_t, dim=1)
 
 
+    def save(self, filepath):
+        """Save the trained model to a file."""
+        with open(filepath, 'wb') as f:
+            joblib.dump({
+                'generator': self._generator,
+                'transformer': self._transformer,
+                'embedding_dim': self._embedding_dim,
+                'generator_dim': self._generator_dim,
+                'discriminator_dim': self._discriminator_dim,
+                'device': self._device
+            }, f)
+    def load(self, filepath):
+        """Load a trained model from a file."""
+        with open(filepath, 'rb') as f:
+            state = joblib.load(f)
+            self._generator = state['generator']
+            self._transformer = state['transformer']
+            self._embedding_dim = state['embedding_dim']
+            self._generator_dim = state['generator_dim']
+            self._discriminator_dim = state['discriminator_dim']
+            self._device = state['device']
+            self._generator.to(self._device)
+        return self
 
+    def plot_losses(self, filename='gan_loss_plot.png'):
+        """Plot the generator and discriminator losses."""
+        plt.figure(figsize=(10, 5))
+        
+        # Plot the loss values over epochs
+        plt.plot(self.loss_values['Epoch'], self.loss_values['Generator Loss'], label='Generator Loss')
+        plt.plot(self.loss_values['Epoch'], self.loss_values['Discriminator Loss'], label='Discriminator Loss')
+        
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('GAN Training Losses')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(filename)
+        plt.close()
 
     @random_state
     def fit(self, train_data, discrete_columns=(), epochs=None):
@@ -262,12 +301,9 @@ class CTGAN(BaseSynthesizer):
         self._transformer.fit(train_data, discrete_columns)
         epochs = self._epochs
         train_data = self._transformer.transform(train_data)
+        print(f"Transformed data shape {train_data.shape} \n")
         train_data = torch.from_numpy(train_data.astype('float32')).to(self._device)
-
         data_len = len(train_data)
-
-
-
         data_dim = self._transformer.output_dimensions
 
         self._generator = Generator(
@@ -361,6 +397,30 @@ class CTGAN(BaseSynthesizer):
                 epoch_iterator.set_description(
                     description.format(gen=generator_loss, dis=discriminator_loss)
                 )
+            # Save model and generate samples every 50 epochs
+            if (i + 1) % 50 == 0:
+                # Create directories if they don't exist
+                os.makedirs("Lego-gan-saved-models", exist_ok=True)
+                os.makedirs("lego-gan-samples", exist_ok=True)
+                
+                # Save model
+                model_path = f'Lego-gan-saved-models/model_checkpoint_epoch_{i+1}.pkl'
+                self.save(model_path)
+                print(f"GAN model saved at epoch {i+1} to {model_path}")
+                
+                # Generate 100k samples
+                samples_path = f'lego-gan-samples/samples_epoch_{i+1}.csv'
+                samples = self.sample(100000)
+                
+                # Save samples (assuming they're a DataFrame or can be converted to one)
+                if isinstance(samples, np.ndarray):
+                    pd.DataFrame(samples).to_csv(samples_path, index=False)
+                else:
+                    samples.to_csv(samples_path, index=False)
+                print(f"Generated 100k samples at epoch {i+1}, saved to {samples_path}")
+        
+        # Plot losses at the end of training
+        self.plot_losses(filename='gan_loss_plot.png')
 
     @random_state
     def sample(self, samples):

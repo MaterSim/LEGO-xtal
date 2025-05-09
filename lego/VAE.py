@@ -12,11 +12,7 @@ from tqdm import tqdm
 from .data_transformer import DataTransformer
 from .base import BaseSynthesizer, random_state
 import matplotlib.pyplot as plt
-
-
 import joblib
-
-
 import random
 
 #random.seed(42)
@@ -203,19 +199,14 @@ class TVAE(BaseSynthesizer):
         """
 
         self.transformer = DataTransformer()
-
-        #diff_raw = train_data.iloc[6] - train_data.iloc[0]
-        #print("=====diff_raw", diff_raw)
-        #print("=====diff_raw-L2", np.sum(diff_raw**2))
         self.transformer.fit(train_data, discrete_columns)
+        print("Train Data  ",np.shape(train_data),'\n',train_data[:10])
         train_data = self.transformer.transform(train_data)
         #np.savetxt('transformed_data.csv', train_data[:10], delimiter=',')
-        #print("train_data-shape",np.shape(train_data))
-        #diff = train_data[6] - train_data[0]
-        #print("=====transformed_data_diff", diff)
-        #print("=====transformed_data_diff-L2====================", np.sum(diff**2))
+        print("Transformed Data shape",np.shape(train_data))
+
         dataset = TensorDataset(torch.from_numpy(train_data.astype('float32')).to(self._device))
-        #print('============================transformed_dataset========',dataset[:10])
+        print('============================transformed_dataset========',dataset[:10])
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
 
         data_dim = self.transformer.output_dimensions
@@ -276,6 +267,27 @@ class TVAE(BaseSynthesizer):
                 iterator.set_description(
                     iterator_description.format(loss=loss.detach().cpu().item())
                 )
+            if (i + 1) % 50 == 0:
+                # Create directories if they don't exist
+                import os
+                os.makedirs("Lego-vae-saved-models", exist_ok=True)
+                os.makedirs("lego-vae-samples", exist_ok=True)
+                
+                # Save model
+                model_path = f'Lego-vae-saved-models/model_checkpoint_epoch_{i+1}.pkl'
+                self.save(model_path)
+                print(f"Model saved at epoch {i+1} to {model_path}")
+                
+                # Generate 100k samples
+                samples_path = f'lego-vae-samples/samples_epoch_{i+1}.csv'
+                samples = self.sample(100000)
+                
+                # Save samples (assuming they're a DataFrame or can be converted to one)
+                if isinstance(samples, np.ndarray):
+                    pd.DataFrame(samples).to_csv(samples_path, index=False)
+                else:
+                    samples.to_csv(samples_path, index=False)
+                print(f"Generated 100k samples at epoch {i+1}, saved to {samples_path}")
         self.plot_losses(self.loss_values,filename='epoch_loss_plot.png')
         # Collect the trained mus/stds for each ordered sample and save it
 
