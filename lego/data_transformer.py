@@ -1,7 +1,8 @@
-"""DataTransformer module."""
+"""
+DataTransformer module.
+"""
 
 from collections import namedtuple
-
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -15,7 +16,8 @@ ColumnTransformInfo = namedtuple(
 
 
 class DataTransformer(object):
-    """Data Transformer.
+    """
+    Data Transformer.
 
     Model continuous columns with a BayesianGMM and normalize them to a scalar between [-1, 1]
     and a vector. Discrete columns are encoded using a OneHotEncoder.
@@ -25,24 +27,21 @@ class DataTransformer(object):
         """Create a data transformer.
 
         Args:
-            max_clusters (int):
-                Maximum number of Gaussian distributions in Bayesian GMM.
-            weight_threshold (float):
-                Weight threshold for a Gaussian distribution to be kept.
+            max_clusters (int): Maximum number of Gaussian distributions in Bayesian GMM.
+            weight_threshold (float): Weight threshold for a Gaussian distribution to be kept.
         """
         self._max_clusters = max_clusters
         self._weight_threshold = weight_threshold
 
     def _fit_continuous(self, data):
-        """Train Bayesian GMM for continuous columns.
+        """
+        Train Bayesian GMM for continuous columns.
 
         Args:
-            data (pd.DataFrame):
-                A dataframe containing a column.
+            data (pd.DataFrame): A dataframe containing a column.
 
         Returns:
-            namedtuple:
-                A ``ColumnTransformInfo`` object.
+            namedtuple: A ``ColumnTransformInfo`` object.
         """
         column_name = data.columns[0]
         gm = ClusterBasedNormalizer(
@@ -65,12 +64,10 @@ class DataTransformer(object):
         """Fit one hot encoder for discrete column.
 
         Args:
-            data (pd.DataFrame):
-                A dataframe containing a column.
+            data (pd.DataFrame): A dataframe containing a column.
 
         Returns:
-            namedtuple:
-                A ``ColumnTransformInfo`` object.
+            namedtuple: A ``ColumnTransformInfo`` object.
         """
         column_name = data.columns[0]
         ohe = OneHotEncoder()
@@ -86,7 +83,8 @@ class DataTransformer(object):
         )
 
     def fit(self, raw_data, discrete_columns=()):
-        """Fit the ``DataTransformer``.
+        """
+        Fit the ``DataTransformer``.
 
         Fits a ``ClusterBasedNormalizer`` for continuous columns and a
         ``OneHotEncoder`` for discrete columns.
@@ -154,8 +152,8 @@ class DataTransformer(object):
         return column_data_list
 
     def _parallel_transform(self, raw_data, column_transform_info_list):
-        """Take a Pandas DataFrame and transform columns in parallel.
-
+        """
+        Take a Pandas DataFrame and transform columns in parallel.
         Outputs a list with Numpy arrays.
         """
         processes = []
@@ -172,7 +170,9 @@ class DataTransformer(object):
         return Parallel(n_jobs=-1)(processes)
 
     def transform(self, raw_data):
-        """Take raw data and output a matrix data."""
+        """
+        Take raw data and output a matrix data.
+        """
         if not isinstance(raw_data, pd.DataFrame):
             column_names = [str(num) for num in range(raw_data.shape[1])]
             raw_data = pd.DataFrame(raw_data, columns=column_names)
@@ -204,7 +204,8 @@ class DataTransformer(object):
         return ohe.reverse_transform(data)[column_transform_info.column_name]
 
     def inverse_transform(self, data, sigmas=None):
-        """Take matrix data and output raw data.
+        """
+        Take matrix data and output raw data.
 
         Output uses the same type as input to the transform function.
         Either np array or pd dataframe.
@@ -238,7 +239,10 @@ class DataTransformer(object):
         return recovered_data
 
     def convert_column_name_value_to_id(self, column_name, value):
-        """Get the ids of the given `column_name`."""
+        """
+        Get the ids of the given `column_name`.
+        """
+
         discrete_counter = 0
         column_id = 0
         for column_transform_info in self._column_transform_info_list:

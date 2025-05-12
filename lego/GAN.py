@@ -1,7 +1,8 @@
 """
 GAN module, inspired by the CTGAN paper
+https://arxiv.org/abs/1907.00503
 """
-
+import os
 import joblib
 import numpy as np
 import pandas as pd
@@ -9,14 +10,21 @@ import torch
 from torch import optim
 from torch.nn import BatchNorm1d, Dropout, LeakyReLU, Linear, Module, ReLU, Sequential, functional
 from tqdm import tqdm
-import os
 from .data_transformer import DataTransformer
 from .base import BaseSynthesizer, random_state
-import matplotlib.pyplot as plt
 
 
 class Discriminator(Module):
-    """Discriminator for the CTGAN."""
+    """
+    Discriminator for the CTGAN.
+
+    Args:
+        input_dim (int): Size of the input data.
+        discriminator_dim (tuple or list of ints):
+            Size of the output samples for each one of the Discriminator Layers.
+            A Linear Layer will be created for each one of the values provided.
+        pac (int): Number of samples to group together. Defaults to 10.
+    """
 
     def __init__(self, input_dim, discriminator_dim, pac=10):
         super(Discriminator, self).__init__()
@@ -56,13 +64,16 @@ class Discriminator(Module):
         return gradient_penalty
 
     def forward(self, input_):
-        """Apply the Discriminator to the `input_`."""
+        """
+        Apply the Discriminator to the `input_`.
+        """
         assert input_.shape[0] % self.pac == 0
         return self.seq(input_.view(-1, self.pacdim))
 
-
 class Residual(Module):
-    """Residual layer for the CTGAN."""
+    """
+    Residual layer for the CTGAN.
+    """
 
     def __init__(self, i, o):
         super(Residual, self).__init__()
@@ -79,7 +90,16 @@ class Residual(Module):
 
 
 class Generator(Module):
-    """Generator for the CTGAN."""
+    """
+    Generator for the CTGAN.
+
+    Args:
+        embedding_dim (int): Size of the random sample passed to the Generator.
+        generator_dim (tuple or list of ints):
+            Size of the output samples for each one of the Residuals.
+            A Residual Layer will be created for each one of the values provided.
+        data_dim (int): Size of the output data.
+    """
 
     def __init__(self, embedding_dim, generator_dim, data_dim):
         super(Generator, self).__init__()
@@ -92,18 +112,11 @@ class Generator(Module):
         self.seq = Sequential(*seq)
 
     def forward(self, input_):
-        """Apply the Generator to the `input_`."""
-        data = self.seq(input_)
-        return data
-
+        return self.seq(input_)
 
 class CTGAN(BaseSynthesizer):
-    """Conditional Table GAN Synthesizer.
-
-    This is the core class of the CTGAN project, where the different components
-    are orchestrated together.
-    For more details about the process, please check the [Modeling Tabular data using
-    Conditional GAN](https://arxiv.org/abs/1907.00503) paper.
+    """
+    CTGAN Synthesizer.
 
     Args:
         embedding_dim (int):
@@ -275,12 +288,19 @@ class CTGAN(BaseSynthesizer):
         return self
 
     def plot_losses(self, filename='gan_loss_plot.png'):
-        """Plot the generator and discriminator losses."""
-        plt.figure(figsize=(10, 5))
-        
+        """
+        Plot the generator and discriminator losses.
+        """
+        import matplotlib.pyplot as plt
+
         # Plot the loss values over epochs
-        plt.plot(self.loss_values['Epoch'], self.loss_values['Generator Loss'], label='Generator Loss')
-        plt.plot(self.loss_values['Epoch'], self.loss_values['Discriminator Loss'], label='Discriminator Loss')
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.loss_values['Epoch'], 
+                 self.loss_values['Generator Loss'],
+                 label='Generator Loss')
+        plt.plot(self.loss_values['Epoch'],
+                 self.loss_values['Discriminator Loss'],
+                 label='Discriminator Loss')
         
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
@@ -292,7 +312,8 @@ class CTGAN(BaseSynthesizer):
 
     @random_state
     def fit(self, train_data, discrete_columns=(), epochs=None):
-        """Fit the CTGAN Synthesizer models to the training data.
+        """
+        Fit the CTGAN Synthesizer models to the training data.
 
         Args:
             train_data (numpy.ndarray or pandas.DataFrame):
@@ -428,11 +449,11 @@ class CTGAN(BaseSynthesizer):
 
     @random_state
     def sample(self, samples):
-        """Sample data similar to the training data.
+        """
+        Sample data similar to the training data.
 
         Args:
-            samples (int):
-                Number of rows to sample.
+            samples (int): Number of rows to sample.
 
         Returns:
             numpy.ndarray or pandas.DataFrame
@@ -454,7 +475,9 @@ class CTGAN(BaseSynthesizer):
         return self._transformer.inverse_transform(data)
 
     def set_device(self, device):
-        """Set the `device` to be used ('GPU' or 'CPU)."""
+        """
+        Set the `device` to be used ('GPU' or 'CPU).
+        """
         self._device = device
         if self._generator is not None:
             self._generator.to(self._device)
