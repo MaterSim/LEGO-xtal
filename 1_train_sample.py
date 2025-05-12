@@ -98,6 +98,7 @@ if __name__ == "__main__":
             epochs=args.epochs,
             pac=10,
             cuda=cuda,
+            folder="models/CTGAN",
         )
 
     elif model == "TVAE":
@@ -111,6 +112,7 @@ if __name__ == "__main__":
             verbose=True,
             cuda=cuda,
             batch_size=args.nbatch,
+            folder = "models/TVAE",
         )
     else:
         raise RuntimeError("Only supports CTGAN/TVAE, not", model)
@@ -127,7 +129,7 @@ if __name__ == "__main__":
 
     print(f"(synthetic data sample\n {df_synthetic.head(10)}\n")
     os.makedirs("data/sample", exist_ok=True)
-    output_file = f"data/sample/{args.model}-dis{len(dis_cols)}.csv"
+    output_file = f"data/sample/{args.model}-dis{len(dis_cols)}-{args.sample}.csv"
     print(f"Save {synthetic_data_size} samples to {output_file}")
     df_synthetic.columns = df_synthetic.columns.str.replace(" ", "")
     df_synthetic = df_synthetic.map(lambda x: str(x).replace(",", " "))

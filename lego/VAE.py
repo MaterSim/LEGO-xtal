@@ -13,7 +13,7 @@ from .data_transformer import DataTransformer
 from .base import BaseSynthesizer, random_state
 import matplotlib.pyplot as plt
 import joblib
-import random
+import os
 
 #random.seed(42)
 #np.random.seed(42)
@@ -122,6 +122,7 @@ class TVAE(BaseSynthesizer):
         loss_factor=2,
         cuda=True,
         verbose=False,
+        folder='LEGO-VAE',
     ):
         self.embedding_dim = embedding_dim
         self.compress_dims = compress_dims
@@ -145,8 +146,14 @@ class TVAE(BaseSynthesizer):
         #store encoded features for last step
         self.full_encoded_mu = []
         self.full_encoded_std = []
+        self.root_folder = folder
+        self.samples_folder = os.path.join(folder, 'samples')
+        self.model_folder = os.path.join(folder, 'models')
+        os.makedirs(self.root_folder, exist_ok=True)
+        os.makedirs(self.samples_folder, exist_ok=True)
+        os.makedirs(self.model_folder, exist_ok=True)
 
-    def plot_losses(self,loss_values,filename='loss_plot.png'):
+    def plot_losses(self, loss_values, filename='loss_plot.png'):
         plt.figure(figsize=(10, 5))
 
         # Plot the loss values over iterations
@@ -157,9 +164,8 @@ class TVAE(BaseSynthesizer):
         plt.title('Loss over Iterations')
         plt.legend()
         plt.grid(True)
-        plt.savefig(filename)
+        plt.savefig(os.path.join(self.root_folder, filename))
         plt.close()
-
 
     def save(self, filepath):
         """Save the trained model to a file."""
@@ -267,19 +273,14 @@ class TVAE(BaseSynthesizer):
                 iterator.set_description(
                     iterator_description.format(loss=loss.detach().cpu().item())
                 )
-            if (i + 1) % 50 == 0:
-                # Create directories if they don't exist
-                import os
-                os.makedirs("Lego-vae-saved-models", exist_ok=True)
-                os.makedirs("lego-vae-samples", exist_ok=True)
-                
+            if (i + 1) % 50 == 0:  
                 # Save model
-                model_path = f'Lego-vae-saved-models/model_checkpoint_epoch_{i+1}.pkl'
+                model_path = f'{self.model_folder}/model_checkpoint_epoch_{i+1}.pkl'
                 self.save(model_path)
                 print(f"Model saved at epoch {i+1} to {model_path}")
                 
                 # Generate 100k samples
-                samples_path = f'lego-vae-samples/samples_epoch_{i+1}.csv'
+                samples_path = f'{self.samples_folder}/samples_epoch_{i+1}.csv'
                 samples = self.sample(100000)
                 
                 # Save samples (assuming they're a DataFrame or can be converted to one)
@@ -288,12 +289,8 @@ class TVAE(BaseSynthesizer):
                 else:
                     samples.to_csv(samples_path, index=False)
                 print(f"Generated 100k samples at epoch {i+1}, saved to {samples_path}")
-        self.plot_losses(self.loss_values,filename='epoch_loss_plot.png')
+        self.plot_losses(self.loss_values, filename='epoch_loss_plot.png')
         # Collect the trained mus/stds for each ordered sample and save it
-
-
-
-
 
     @random_state
     def sample(self, samples):

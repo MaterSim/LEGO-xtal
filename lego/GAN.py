@@ -2,7 +2,6 @@
 GAN module, inspired by the CTGAN paper
 """
 
-import warnings
 import joblib
 import numpy as np
 import pandas as pd
@@ -161,6 +160,7 @@ class CTGAN(BaseSynthesizer):
         epochs=300,
         pac=10,
         cuda=True,
+        folder='LEGO-GAN',
     ):
         assert batch_size % 2 == 0
 
@@ -193,6 +193,12 @@ class CTGAN(BaseSynthesizer):
         self._data_sampler = None
         self._generator = None
         self.loss_values = None
+        self.root_folder = folder
+        self.model_folder = os.path.join(self.root_folder, "models")
+        self.samples_folder = os.path.join(self.root_folder, "samples")
+        os.makedirs(self.folder, exist_ok=True)
+        os.makedirs(self.samples_folder, exist_ok=True)
+        os.makedirs(self.model_folder, exist_ok=True)
 
     @staticmethod
     def _gumbel_softmax(logits, tau=1, hard=False, eps=1e-10, dim=-1):
@@ -254,6 +260,7 @@ class CTGAN(BaseSynthesizer):
                 'discriminator_dim': self._discriminator_dim,
                 'device': self._device
             }, f)
+
     def load(self, filepath):
         """Load a trained model from a file."""
         with open(filepath, 'rb') as f:
@@ -280,7 +287,7 @@ class CTGAN(BaseSynthesizer):
         plt.title('GAN Training Losses')
         plt.legend()
         plt.grid(True)
-        plt.savefig(filename)
+        plt.savefig(os.path.join(self.root_folder, filename))
         plt.close()
 
     @random_state
@@ -399,17 +406,14 @@ class CTGAN(BaseSynthesizer):
                 )
             # Save model and generate samples every 50 epochs
             if (i + 1) % 50 == 0:
-                # Create directories if they don't exist
-                os.makedirs("Lego-gan-saved-models", exist_ok=True)
-                os.makedirs("lego-gan-samples", exist_ok=True)
                 
                 # Save model
-                model_path = f'Lego-gan-saved-models/model_checkpoint_epoch_{i+1}.pkl'
+                model_path = f'{self.model_folder}/model_checkpoint_epoch_{i+1}.pkl'
                 self.save(model_path)
                 print(f"GAN model saved at epoch {i+1} to {model_path}")
                 
                 # Generate 100k samples
-                samples_path = f'lego-gan-samples/samples_epoch_{i+1}.csv'
+                samples_path = f'{self.samples_folder}/samples_epoch_{i+1}.csv'
                 samples = self.sample(100000)
                 
                 # Save samples (assuming they're a DataFrame or can be converted to one)
@@ -420,7 +424,7 @@ class CTGAN(BaseSynthesizer):
                 print(f"Generated 100k samples at epoch {i+1}, saved to {samples_path}")
         
         # Plot losses at the end of training
-        self.plot_losses(filename='gan_loss_plot.png')
+        self.plot_losses()
 
     @random_state
     def sample(self, samples):

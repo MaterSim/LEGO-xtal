@@ -18,7 +18,7 @@ for model in CTGAN TVAE
 do
   # Check if the CSV file exists, if not create it
     START=$(date +%s)
-    python 1_train_sample.py --data ${DATAFILE} --model ${model} --sample 100000
+    python 1_train_sample.py --data ${DATAFILE} --model ${model} --sample 200000
     END=$(date +%s)
     ELAPSED_TIME=$((END - START))
     echo "Relaxation script completed in $((ELAPSED_TIME / 60)) minutes."
