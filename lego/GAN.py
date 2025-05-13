@@ -1,8 +1,8 @@
 """
 GAN module, inspired by the CTGAN paper
+https://arxiv.org/abs/1907.00503
 """
-
-import warnings
+import os
 import joblib
 import numpy as np
 import pandas as pd
@@ -10,14 +10,21 @@ import torch
 from torch import optim
 from torch.nn import BatchNorm1d, Dropout, LeakyReLU, Linear, Module, ReLU, Sequential, functional
 from tqdm import tqdm
-import os
 from .data_transformer import DataTransformer
 from .base import BaseSynthesizer, random_state
-import matplotlib.pyplot as plt
 
 
 class Discriminator(Module):
-    """Discriminator for the CTGAN."""
+    """
+    Discriminator for the CTGAN.
+
+    Args:
+        input_dim (int): Size of the input data.
+        discriminator_dim (tuple or list of ints):
+            Size of the output samples for each one of the Discriminator Layers.
+            A Linear Layer will be created for each one of the values provided.
+        pac (int): Number of samples to group together. Defaults to 10.
+    """
 
     def __init__(self, input_dim, discriminator_dim, pac=10):
         super(Discriminator, self).__init__()
@@ -57,13 +64,16 @@ class Discriminator(Module):
         return gradient_penalty
 
     def forward(self, input_):
-        """Apply the Discriminator to the `input_`."""
+        """
+        Apply the Discriminator to the `input_`.
+        """
         assert input_.shape[0] % self.pac == 0
         return self.seq(input_.view(-1, self.pacdim))
 
-
 class Residual(Module):
-    """Residual layer for the CTGAN."""
+    """
+    Residual layer for the CTGAN.
+    """
 
     def __init__(self, i, o):
         super(Residual, self).__init__()
@@ -80,7 +90,16 @@ class Residual(Module):
 
 
 class Generator(Module):
-    """Generator for the CTGAN."""
+    """
+    Generator for the CTGAN.
+
+    Args:
+        embedding_dim (int): Size of the random sample passed to the Generator.
+        generator_dim (tuple or list of ints):
+            Size of the output samples for each one of the Residuals.
+            A Residual Layer will be created for each one of the values provided.
+        data_dim (int): Size of the output data.
+    """
 
     def __init__(self, embedding_dim, generator_dim, data_dim):
         super(Generator, self).__init__()
@@ -93,18 +112,11 @@ class Generator(Module):
         self.seq = Sequential(*seq)
 
     def forward(self, input_):
-        """Apply the Generator to the `input_`."""
-        data = self.seq(input_)
-        return data
-
+        return self.seq(input_)
 
 class CTGAN(BaseSynthesizer):
-    """Conditional Table GAN Synthesizer.
-
-    This is the core class of the CTGAN project, where the different components
-    are orchestrated together.
-    For more details about the process, please check the [Modeling Tabular data using
-    Conditional GAN](https://arxiv.org/abs/1907.00503) paper.
+    """
+    CTGAN Synthesizer.
 
     Args:
         embedding_dim (int):
@@ -161,6 +173,7 @@ class CTGAN(BaseSynthesizer):
         epochs=300,
         pac=10,
         cuda=True,
+        folder='LEGO-GAN',
     ):
         assert batch_size % 2 == 0
 
@@ -193,6 +206,12 @@ class CTGAN(BaseSynthesizer):
         self._data_sampler = None
         self._generator = None
         self.loss_values = None
+        self.root_folder = folder
+        self.model_folder = os.path.join(self.root_folder, "models")
+        self.samples_folder = os.path.join(self.root_folder, "samples")
+        os.makedirs(self.folder, exist_ok=True)
+        os.makedirs(self.samples_folder, exist_ok=True)
+        os.makedirs(self.model_folder, exist_ok=True)
 
     @staticmethod
     def _gumbel_softmax(logits, tau=1, hard=False, eps=1e-10, dim=-1):
@@ -254,6 +273,7 @@ class CTGAN(BaseSynthesizer):
                 'discriminator_dim': self._discriminator_dim,
                 'device': self._device
             }, f)
+
     def load(self, filepath):
         """Load a trained model from a file."""
         with open(filepath, 'rb') as f:
@@ -268,24 +288,32 @@ class CTGAN(BaseSynthesizer):
         return self
 
     def plot_losses(self, filename='gan_loss_plot.png'):
-        """Plot the generator and discriminator losses."""
-        plt.figure(figsize=(10, 5))
-        
+        """
+        Plot the generator and discriminator losses.
+        """
+        import matplotlib.pyplot as plt
+
         # Plot the loss values over epochs
-        plt.plot(self.loss_values['Epoch'], self.loss_values['Generator Loss'], label='Generator Loss')
-        plt.plot(self.loss_values['Epoch'], self.loss_values['Discriminator Loss'], label='Discriminator Loss')
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.loss_values['Epoch'], 
+                 self.loss_values['Generator Loss'],
+                 label='Generator Loss')
+        plt.plot(self.loss_values['Epoch'],
+                 self.loss_values['Discriminator Loss'],
+                 label='Discriminator Loss')
         
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.title('GAN Training Losses')
         plt.legend()
         plt.grid(True)
-        plt.savefig(filename)
+        plt.savefig(os.path.join(self.root_folder, filename))
         plt.close()
 
     @random_state
     def fit(self, train_data, discrete_columns=(), epochs=None):
-        """Fit the CTGAN Synthesizer models to the training data.
+        """
+        Fit the CTGAN Synthesizer models to the training data.
 
         Args:
             train_data (numpy.ndarray or pandas.DataFrame):
@@ -400,17 +428,22 @@ class CTGAN(BaseSynthesizer):
                 )
             # Save model and generate samples every 50 epochs
             if (i + 1) % 50 == 0:
-                # Create directories if they don't exist
-                os.makedirs("Lego-gan-saved-models", exist_ok=True)
-                os.makedirs("lego-gan-samples", exist_ok=True)
                 
                 # Save model
+<<<<<<< HEAD
                 model_path = f'Lego-gan-saved-models/GAN_model_checkpoint_epoch_{i+1}.pkl'
+=======
+                model_path = f'{self.model_folder}/model_checkpoint_epoch_{i+1}.pkl'
+>>>>>>> 3d9ef55d0d0896bb3ba185ecfe8f9f367f8b3f21
                 self.save(model_path)
                 print(f"GAN model saved at epoch {i+1} to {model_path}")
                 
                 # Generate 100k samples
+<<<<<<< HEAD
                 samples_path = f'lego-gan-samples/GAN_epoch_{i+1}.csv'
+=======
+                samples_path = f'{self.samples_folder}/samples_epoch_{i+1}.csv'
+>>>>>>> 3d9ef55d0d0896bb3ba185ecfe8f9f367f8b3f21
                 samples = self.sample(100000)
                 
                 # Save samples (assuming they're a DataFrame or can be converted to one)
@@ -421,15 +454,15 @@ class CTGAN(BaseSynthesizer):
                 print(f"Generated 100k samples at epoch {i+1}, saved to {samples_path}")
         
         # Plot losses at the end of training
-        self.plot_losses(filename='gan_loss_plot.png')
+        self.plot_losses()
 
     @random_state
     def sample(self, samples):
-        """Sample data similar to the training data.
+        """
+        Sample data similar to the training data.
 
         Args:
-            samples (int):
-                Number of rows to sample.
+            samples (int): Number of rows to sample.
 
         Returns:
             numpy.ndarray or pandas.DataFrame
@@ -451,7 +484,9 @@ class CTGAN(BaseSynthesizer):
         return self._transformer.inverse_transform(data)
 
     def set_device(self, device):
-        """Set the `device` to be used ('GPU' or 'CPU)."""
+        """
+        Set the `device` to be used ('GPU' or 'CPU).
+        """
         self._device = device
         if self._generator is not None:
             self._generator.to(self._device)

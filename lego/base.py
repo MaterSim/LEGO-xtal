@@ -1,7 +1,6 @@
 """BaseSynthesizer module."""
 
 import contextlib
-
 import numpy as np
 import torch
 
@@ -38,11 +37,11 @@ def set_random_states(random_state, set_model_random_state):
 
 
 def random_state(function):
-    """Set the random state before calling the function.
+    """
+    Set the random state before calling the function.
 
     Args:
-        function (Callable):
-            The function to wrap around.
+        function (Callable): The function to wrap around.
     """
 
     def wrapper(self, *args, **kwargs):
@@ -57,20 +56,18 @@ def random_state(function):
 
 
 class BaseSynthesizer:
-    """Base class for all default synthesizers of ``CTGAN``."""
+    """
+    Base class for all default synthesizers.
+    """
 
     random_states = None
 
     def __getstate__(self):
-        """Improve pickling state for ``BaseSynthesizer``.
-
-        Convert to ``cpu`` device before starting the pickling process in order to be able to
-        load the model even when used from an external tool such as ``SDV``. Also, if
-        ``random_states`` are set, store their states as dictionaries rather than generators.
+        """
+        Improve pickling state for ``BaseSynthesizer``.
 
         Returns:
-            dict:
-                Python dict representing the object.
+            dict: Python dict representing the object.
         """
         device_backup = self._device
         self.set_device(torch.device('cpu'))
@@ -88,7 +85,8 @@ class BaseSynthesizer:
         return state
 
     def __setstate__(self, state):
-        """Restore the state of a ``BaseSynthesizer``.
+        """
+        Restore the state of a ``BaseSynthesizer``.
 
         Restore the ``random_states`` from the state dict if those are present and then
         set the device according to the current hardware.
@@ -109,7 +107,9 @@ class BaseSynthesizer:
         self.set_device(device)
 
     def save(self, path):
-        """Save the model in the passed `path`."""
+        """
+        Save the model in the passed `path`.
+        """
         device_backup = self._device
         self.set_device(torch.device('cpu'))
         torch.save(self, path)
@@ -117,14 +117,17 @@ class BaseSynthesizer:
 
     @classmethod
     def load(cls, path):
-        """Load the model stored in the passed `path`."""
+        """
+        Load the model stored in the passed `path`.
+        """
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         model = torch.load(path)
         model.set_device(device)
         return model
 
     def set_random_state(self, random_state):
-        """Set the random state.
+        """
+        Set the random state.
 
         Args:
             random_state (int, tuple, or None):
