@@ -47,10 +47,15 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
+        print("cuda is available")
         cuda = True
     else:
         cuda = False
-
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"CUDA device count: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        print(f"Current CUDA device: {torch.cuda.current_device()}")
+        print(f"Device name: {torch.cuda.get_device_name()}")
     # Read data
     df = pd.read_csv(args.data)
     if args.cutoff is not None and len(df) > args.cutoff:
@@ -85,8 +90,8 @@ if __name__ == "__main__":
     if model == "CTGAN":
         synthesizer = CTGAN(
             embedding_dim=128,
-            generator_dim=(256, 256),
-            discriminator_dim=(256, 256),
+            generator_dim=(512, 512),
+            discriminator_dim=(512, 512),
             generator_lr=2e-4,
             generator_decay=1e-6,
             discriminator_lr=2e-4,
@@ -103,8 +108,8 @@ if __name__ == "__main__":
     elif model == "TVAE":
         synthesizer = TVAE(
             embedding_dim=128,
-            compress_dims=(1024, 1024),
-            decompress_dims=(1024, 1024),
+            compress_dims=(512, 512),
+            decompress_dims=(512, 512),
             l2scale=1e-5,
             loss_factor=2,
             epochs=args.epochs,

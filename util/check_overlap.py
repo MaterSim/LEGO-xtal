@@ -2,7 +2,7 @@ from pyxtal.db import database_topology
 from glob import glob
 import numpy as np
 
-sp2 = '../../dataset/dbs/sp2_sacada.db'
+sp2 = 'data/source/sp2_sacada.db'
 db_names = [sp2] + glob('*/final.db')
 
 for db_name in db_names[1:]:

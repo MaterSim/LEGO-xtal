@@ -204,7 +204,7 @@ class TVAE(BaseSynthesizer):
         train_data = self.transformer.transform(train_data)
         #np.savetxt('transformed_data.csv', train_data[:10], delimiter=',')
         print("Transformed Data shape",np.shape(train_data))
-
+        print(f" Device: {self._device} \n")
         dataset = TensorDataset(torch.from_numpy(train_data.astype('float32')).to(self._device))
         print('============================transformed_dataset========',dataset[:10])
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)

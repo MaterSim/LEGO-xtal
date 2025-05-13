@@ -303,6 +303,7 @@ class CTGAN(BaseSynthesizer):
         train_data = self._transformer.transform(train_data)
         print(f"Transformed data shape {train_data.shape} \n")
         train_data = torch.from_numpy(train_data.astype('float32')).to(self._device)
+        print(f" Device: {self._device} \n")
         data_len = len(train_data)
         data_dim = self._transformer.output_dimensions
 
@@ -404,12 +405,12 @@ class CTGAN(BaseSynthesizer):
                 os.makedirs("lego-gan-samples", exist_ok=True)
                 
                 # Save model
-                model_path = f'Lego-gan-saved-models/model_checkpoint_epoch_{i+1}.pkl'
+                model_path = f'Lego-gan-saved-models/GAN_model_checkpoint_epoch_{i+1}.pkl'
                 self.save(model_path)
                 print(f"GAN model saved at epoch {i+1} to {model_path}")
                 
                 # Generate 100k samples
-                samples_path = f'lego-gan-samples/samples_epoch_{i+1}.csv'
+                samples_path = f'lego-gan-samples/GAN_epoch_{i+1}.csv'
                 samples = self.sample(100000)
                 
                 # Save samples (assuming they're a DataFrame or can be converted to one)
