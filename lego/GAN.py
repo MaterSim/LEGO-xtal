@@ -16,7 +16,7 @@ from .base import BaseSynthesizer, random_state
 
 class Discriminator(Module):
     """
-    Discriminator for the CTGAN.
+    Discriminator for the GAN.
 
     Args:
         input_dim (int): Size of the input data.
@@ -72,7 +72,7 @@ class Discriminator(Module):
 
 class Residual(Module):
     """
-    Residual layer for the CTGAN.
+    Residual layer for the GAN.
     """
 
     def __init__(self, i, o):
@@ -91,7 +91,7 @@ class Residual(Module):
 
 class Generator(Module):
     """
-    Generator for the CTGAN.
+    Generator for the GAN.
 
     Args:
         embedding_dim (int): Size of the random sample passed to the Generator.
@@ -114,9 +114,9 @@ class Generator(Module):
     def forward(self, input_):
         return self.seq(input_)
 
-class CTGAN(BaseSynthesizer):
+class GAN(BaseSynthesizer):
     """
-    CTGAN Synthesizer.
+    GAN Synthesizer.
 
     Args:
         embedding_dim (int):
@@ -140,7 +140,7 @@ class CTGAN(BaseSynthesizer):
         discriminator_steps (int):
             Number of discriminator updates to do for each generator update.
             From the WGAN paper: https://arxiv.org/abs/1701.07875. WGAN paper
-            default is 5. Default used is 1 to match original CTGAN implementation.
+            default is 5. Default used is 1 to match original GAN implementation.
         log_frequency (boolean):
             Whether to use log frequency of categorical levels in conditional
             sampling. Defaults to ``True``.
@@ -173,6 +173,7 @@ class CTGAN(BaseSynthesizer):
         epochs=300,
         pac=10,
         cuda=True,
+        type='continuous',
         folder='LEGO-GAN',
     ):
         assert batch_size % 2 == 0
@@ -206,10 +207,13 @@ class CTGAN(BaseSynthesizer):
         self._data_sampler = None
         self._generator = None
         self.loss_values = None
+        self.type = type
         self.root_folder = folder
-        self.model_folder = os.path.join(self.root_folder, "models")
-        self.samples_folder = os.path.join(self.root_folder, "samples")
-        os.makedirs(self.folder, exist_ok=True)
+        self.type_folder = os.path.join(self.root_folder, self.type)
+        self.samples_folder = os.path.join(self.type_folder, 'samples')
+        self.model_folder = os.path.join(self.type_folder, 'models')
+        os.makedirs(self.root_folder, exist_ok=True)
+        os.makedirs(self.type_folder, exist_ok=True)
         os.makedirs(self.samples_folder, exist_ok=True)
         os.makedirs(self.model_folder, exist_ok=True)
 
@@ -313,7 +317,7 @@ class CTGAN(BaseSynthesizer):
     @random_state
     def fit(self, train_data, discrete_columns=(), epochs=None):
         """
-        Fit the CTGAN Synthesizer models to the training data.
+        Fit the GAN Synthesizer models to the training data.
 
         Args:
             train_data (numpy.ndarray or pandas.DataFrame):
@@ -430,21 +434,16 @@ class CTGAN(BaseSynthesizer):
             if (i + 1) % 50 == 0:
                 
                 # Save model
-<<<<<<< HEAD
-                model_path = f'Lego-gan-saved-models/GAN_model_checkpoint_epoch_{i+1}.pkl'
-=======
-                model_path = f'{self.model_folder}/model_checkpoint_epoch_{i+1}.pkl'
->>>>>>> 3d9ef55d0d0896bb3ba185ecfe8f9f367f8b3f21
+
+                model_path = f'{self.model_folder}/GAN_{self.type}_model_checkpoint_epoch_{i+1}.pkl'
+
                 self.save(model_path)
                 print(f"GAN model saved at epoch {i+1} to {model_path}")
                 
                 # Generate 100k samples
-<<<<<<< HEAD
-                samples_path = f'lego-gan-samples/GAN_epoch_{i+1}.csv'
-=======
-                samples_path = f'{self.samples_folder}/samples_epoch_{i+1}.csv'
->>>>>>> 3d9ef55d0d0896bb3ba185ecfe8f9f367f8b3f21
-                samples = self.sample(100000)
+
+                samples_path = f'{self.samples_folder}/GAN_{self.type}_samples_epoch_{i+1}.csv'
+                samples = self.sample(500000)
                 
                 # Save samples (assuming they're a DataFrame or can be converted to one)
                 if isinstance(samples, np.ndarray):

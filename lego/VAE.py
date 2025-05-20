@@ -101,7 +101,7 @@ def _loss_function(recon_x, x, sigmas, mu, logvar, output_info, factor):
     return sum(loss) * factor / x.size()[0], KLD / x.size()[0]
 
 
-class TVAE(BaseSynthesizer):
+class VAE(BaseSynthesizer):
     """
     Variational Autoencoder (VAE) for tabular data.
 
@@ -128,6 +128,7 @@ class TVAE(BaseSynthesizer):
         loss_factor=2,
         cuda=True,
         verbose=False,
+        type='discrete',
         folder='LEGO-VAE',
     ):
         self.embedding_dim = embedding_dim
@@ -152,10 +153,13 @@ class TVAE(BaseSynthesizer):
         #store encoded features for last step
         self.full_encoded_mu = []
         self.full_encoded_std = []
+        self.type = type
         self.root_folder = folder
-        self.samples_folder = os.path.join(folder, 'samples')
-        self.model_folder = os.path.join(folder, 'models')
+        self.type_folder = os.path.join(self.root_folder, self.type)
+        self.samples_folder = os.path.join(self.type_folder, 'samples')
+        self.model_folder = os.path.join(self.type_folder, 'models')
         os.makedirs(self.root_folder, exist_ok=True)
+        os.makedirs(self.type_folder, exist_ok=True)
         os.makedirs(self.samples_folder, exist_ok=True)
         os.makedirs(self.model_folder, exist_ok=True)
 
@@ -283,13 +287,13 @@ class TVAE(BaseSynthesizer):
                 )
             if (i + 1) % 50 == 0:  
                 # Save model
-                model_path = f'{self.model_folder}/model_checkpoint_epoch_{i+1}.pkl'
+                model_path = f'{self.model_folder}/VAE_{self.type}_model_checkpoint_epoch_{i+1}.pkl'
                 self.save(model_path)
                 print(f"Model saved at epoch {i+1} to {model_path}")
                 
                 # Generate 100k samples
-                samples_path = f'{self.samples_folder}/samples_epoch_{i+1}.csv'
-                samples = self.sample(100000)
+                samples_path = f'{self.samples_folder}/VAE_{self.type}_samples_epoch_{i+1}.csv'
+                samples = self.sample(500000)
                 
                 # Save samples (assuming they're a DataFrame or can be converted to one)
                 if isinstance(samples, np.ndarray):

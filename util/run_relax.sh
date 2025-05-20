@@ -1,5 +1,5 @@
 #!/bin/sh -l
-#SBATCH --partition=Apus
+#SBATCH --partition=Orion
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96
@@ -35,7 +35,7 @@ NCPU2=$((NCPU/4))
 # Conditionally run relax.py if RUN_RELAX is set to "yes"
 if [ "$RUN_RELAX" = "yes" ]; then
   # Run the relaxation script with the specified number of CPUs
-  python 2_relax.py --ncpu ${NCPU} --csv data/sample/${MODEL}.csv
+  python 2_relax.py --ncpu ${NCPU} --csv data/sample/${MODEL}.csv --end 100000
 else
   echo "Skipping relax.py"
 fi
