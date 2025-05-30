@@ -3,7 +3,7 @@ from pyxtal.lego.builder import builder
 xtal = pyxtal()
 xtal.from_spg_wps_rep(194, ['2c', '2b'], [2.46, 6.70])
 cif_file = xtal.to_pymatgen()
-bu = builder(['C'], [1], db_file='reaxff.db', verbose=False)
+bu = builder(['C'], [1], verbose=False)
 bu.set_descriptor_calculator(mykwargs={'rcut': 2.0})
 bu.set_reference_enviroments(cif_file)
 

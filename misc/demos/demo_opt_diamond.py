@@ -4,10 +4,10 @@ from pyxtal import pyxtal
 # Get the graphite reference environment and set up optimizer
 xtal = pyxtal()
 xtal.from_prototype('graphite')
-#cif_file = xtal.to_pymatgen()
-bu = builder(['C'], [1], db_file='test.db')
+cif_file = xtal.to_pymatgen()
+bu = builder(['C'], [1])
 bu.set_descriptor_calculator(mykwargs={'rcut': 2.0})
-bu.set_reference_enviroments(xtal)
+bu.set_reference_enviroments(cif_file)
 print(bu)
 
 # Get the diamond crystal
@@ -28,4 +28,3 @@ sub_xtal, loss, _ = bu.optimize_xtal(sub_xtal)
 print(sub_xtal)
 print(sub_xtal.get_1d_rep_x())
 sub_xtal.to_file('sp2.cif')
-
