@@ -38,7 +38,7 @@ col, bin_indices = 2, []
 for i in range(len(natom_bins)-1):
     mask = (data_array[:, col] >= natom_bins[i]) & (data_array[:, col] < natom_bins[i+1])
     bin_indices.append(mask)
-    natom_labels[i] += f" ({mask.sum()})"
+    natom_labels[i] += f" ({mask.sum()}, {mask.sum()*100/len(data_array):.1f}%)"
     print(natom_labels[i], mask.sum())
 
 heights = []
@@ -67,7 +67,7 @@ col, bin_indices = 3, []
 for i in range(len(spg_bins)-1):
     mask = (data_array[:, col] > spg_bins[i]) & (data_array[:, col] <= spg_bins[i+1])
     bin_indices.append(mask)
-    spg_labels[i] += f" ({mask.sum()})"
+    spg_labels[i] += f" ({mask.sum()}, {mask.sum()*100/len(data_array):.1f}%)"
 
 heights = []
 bottom = np.zeros(nbins)
@@ -96,7 +96,7 @@ col, bin_indices = 4, []
 for i in range(len(dim_bins)-1):
     mask = (data_array[:, col] > dim_bins[i]) & (data_array[:, col] <= dim_bins[i+1])
     bin_indices.append(mask)
-    dim_labels[i] += f" ({mask.sum()})"
+    dim_labels[i] += f" ({mask.sum()}, {mask.sum()*100/len(data_array):.1f}%)"
 
 heights = []
 bottom = np.zeros(nbins)
@@ -125,7 +125,7 @@ col, bin_indices = 5, []
 for i in range(len(dof_bins)-1):
     mask = (data_array[:, col] > dof_bins[i]) & (data_array[:, col] <= dof_bins[i+1])
     bin_indices.append(mask)
-    dof_labels[i] += f" ({mask.sum()})"
+    dof_labels[i] += f" ({mask.sum()}, {mask.sum()*100/len(data_array):.1f}%)"
 
 heights = []
 bottom = np.zeros(nbins)
@@ -140,7 +140,7 @@ for i, hist in enumerate(heights):
 print(bins[0], bottom[0], bins[-1], bottom[-1], sum(bottom))
 #ax4.set_xlabel('MACE Energy (eV)')
 ax4.set_ylabel('Count')
-ax4.set_title('(c) Number of variables')
+ax4.set_title('(c) Number of reduced variables')
 ax4.legend(frameon=False, loc=2, bbox_to_anchor=(-0.02, 0.9))
 ax4.grid(False)
 ax4.set_xlim(-0.01, eng_max)
