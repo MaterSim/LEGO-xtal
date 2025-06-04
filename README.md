@@ -3,6 +3,7 @@
 LEGO-Cryst (Local Environment Geometry-Oriented Crystal Generator) is designed for the rapid generation of crystal structures for complex materials characterized by well-defined local structural building units (SBUs). By leveraging a small set of known material examples, LEGO-Cryst learns target crystal structures by exploiting crystal symmetry. A generative model navigates the vast combinatorial space of symmetry operations to produce numerous trial structures, which are then optimized to ensure each atom satisfies the desired local atomic environment.
 
 The LEGO-Cryst workflow is illustrated below using sp²-hybridized carbon structures as an example:
+![LEGO-Cryst Framework](https://raw.githubusercontent.com/MaterSim/LEGO-xtal/misc/Fig-framework.pdf)
 
 1.  **Training Data Collection and Augmentation:**
     *   **Data Selection:** Curate a dataset of known structures (e.g., 140 sp² carbon structures from the SACADA database).
