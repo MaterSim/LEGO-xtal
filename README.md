@@ -1,9 +1,9 @@
 # LEGO-Xtal: Local Environment Geometry-Oriented Crystal Generator
 
-LEGO-Xtal (Local Environment Geometry-Oriented Crystal Generator) is designed for the rapid generation of crystal structures for complex materials characterized by well-defined local structural building units (SBUs). By leveraging a small set of known material examples, LEGO-Cryst learns target crystal structures by exploiting crystal symmetry. A generative model navigates the vast combinatorial space of symmetry operations to produce numerous trial structures, which are then optimized to ensure each atom satisfies the desired local atomic environment.
+LEGO-Xtal (Local Environment Geometry-Oriented Crystal Generator) is designed for the rapid generation of crystal structures for complex materials characterized by well-defined local structural building units (SBUs). By leveraging a small set of known material examples, LEGO-Xtal learns target crystal structures by exploiting crystal symmetry. A generative model navigates the vast combinatorial space of symmetry operations to produce numerous trial structures, which are then optimized to ensure each atom satisfies the desired local atomic environment.
 
-The LEGO-Cryst workflow is illustrated below using sp²-hybridized carbon structures as an example:
-![LEGO-Cryst Framework](https://github.com/MaterSim/LEGO-xtal/blob/main/misc/Fig-framework.png)
+The LEGO-Xtal workflow is illustrated below using sp²-hybridized carbon structures as an example:
+![LEGO-Xtal Framework](https://github.com/MaterSim/LEGO-xtal/blob/main/misc/Fig-framework.png)
 
 1.  **Training Data Collection and Augmentation:**
     *   **Data Selection:** Curate a dataset of known structures (e.g., 140 sp² carbon structures from the SACADA database).
@@ -22,4 +22,4 @@ The LEGO-Cryst workflow is illustrated below using sp²-hybridized carbon struct
     *   Rank the pre-relaxed structures with different energy models (e.g., ReaxFF, MACE or DFT)
     *   Compile the generated and validated structures into a database for further analysis.
 
-By utilizing different SBUs as training sources, LEGO-Xtal can rapidly generate high-quality crystal candidates for designing complex materials, including metal-organic frameworks (MOFs) and battery materials. Combining materials science domain knowledge with advanced AI methodologies, LEGO-Cryst aims to advance AI-driven crystal structure generation, paving the way for more efficient materials discovery and design.
+By utilizing different local environments as training sources, LEGO-Xtal can rapidly generate high-quality crystal candidates for designing complex materials, including metal-organic frameworks (MOFs) and battery materials. Combining materials science domain knowledge with advanced AI methodologies, LEGO-Xtal aims to advance AI-driven crystal structure generation, paving the way for more efficient materials discovery and design.
