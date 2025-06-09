@@ -4,16 +4,16 @@ import numpy as np
 import pandas as pd
 import torch
 
-from lego.GAN import CTGAN
-from lego.VAE import TVAE
+from lego.GAN import GAN
+from lego.VAE import VAE
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Table Synthesizer")
     parser.add_argument("--data", help="Input CSV data")
     parser.add_argument(
         "--model", 
-        default="CTGAN", 
-        help="Models: supports CTGAN, TVAE"
+        default="GAN", 
+        help="Models: supports GAN, VAE"
     )
     parser.add_argument(
         "--epochs",
@@ -87,8 +87,8 @@ if __name__ == "__main__":
     # Initialize synthesizer with specified parameters
     os.makedirs("models", exist_ok=True)
     model = args.model
-    if model == "CTGAN":
-        synthesizer = CTGAN(
+    if model == "GAN":
+        synthesizer = GAN(
             embedding_dim=128,
             generator_dim=(512, 512),
             discriminator_dim=(512, 512),
@@ -103,11 +103,11 @@ if __name__ == "__main__":
             epochs=args.epochs,
             pac=10,
             cuda=cuda,
-            folder="models/CTGAN",
+            folder="models/GAN",
         )
 
-    elif model == "TVAE":
-        synthesizer = TVAE(
+    elif model == "VAE":
+        synthesizer = VAE(
             embedding_dim=128,
             compress_dims=(512, 512),
             decompress_dims=(512, 512),
@@ -117,10 +117,10 @@ if __name__ == "__main__":
             verbose=True,
             cuda=cuda,
             batch_size=args.nbatch,
-            folder = "models/TVAE",
+            folder = "models/VAE",
         )
     else:
-        raise RuntimeError("Only supports CTGAN/TVAE, not", model)
+        raise RuntimeError("Only supports GAN/VAE, not", model)
 
     # Train models
     synthesizer.fit(df, discrete_columns=dis_cols)
