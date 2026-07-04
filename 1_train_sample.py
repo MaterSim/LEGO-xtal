@@ -1,3736 +1,2567 @@
 #!/usr/bin/env python3
-"""Train and sample a factorized TiO2 LEGO-Xtal VAE.
+"""Two-stage TiO2 LEGO-Xtal generator v18 with a differentiable Torch L/R builder.
 
-This version confirms the Ti framework first, then constructs oxygen one
-Wyckoff orbit at a time using a narrowed pooled Si--O/O--O ionic probability
-field. Cached Sobol orbit pools concentrate exact
-search inside promising free-parameter regions while retaining exploration.  The decoder stages are:
-    global:       space group and cell
-    Ti skeleton:  Ti Wyckoff occupancy pattern
-    Ti parameters: site-wise free parameters conditioned on G, Ti skeleton, and prior Ti sites
-    O skeleton:   O Wyckoff occupancy conditioned on the complete Ti block
-    O parameters: free Wyckoff parameters conditioned on sampled O skeleton
+The VAE learns the current factorized representation but generation uses only
+space group and Ti Wyckoff skeleton.  Compact Ti-framework chemistry targets
+are extracted from the training CSV and drive a symmetry-exact differentiable
+builder for lattice and Ti free Wyckoff parameters.
 
-The sampled free parameters are mapped deterministically through PyXtal to exact
-Wyckoff generating coordinates before the standard LEGO CSV is written.
-Sampling applies hard space-group, stoichiometry, and slot-capacity masks.
-Confirmed Ti frameworks are dispatched one per CPU task to a dynamically
-scheduled manager-worker pool for cached ionic-field oxygen construction.
+Phase A generates a symmetry-exact Ti framework from Ti-Ti chemistry. Phase B
+then generates an exact-stoichiometry oxygen sublattice against Ti-O coordination,
+O-Ti-O angular, local shell O-O, O-to-Ti sharing, and collision objectives. Both
+stages use persistent asynchronous one-process-per-GPU workers.
 """
 
+from __future__ import annotations
+
 import argparse
+import hashlib
+import json
+import math
 import os
 import re
-import time
-from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
-from collections import deque
-import contextlib
+import shutil
 import multiprocessing as mp
+import time
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+from collections import deque
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+from ase import Atoms
+from ase.io import write
+from pyxtal.symmetry import Group
 
 from lego.VAE_factorized import FactorizedVAE
-from pyxtal.symmetry import Group
 
 
 BASE_COLUMNS = ["spg", "a", "b", "c", "alpha", "beta", "gamma"]
-# Legacy ``si_*`` names denote the factorized center block.  For this
-# TiO2 workflow, that block contains Ti sites; retaining the names avoids a
-# representation and checkpoint migration.
-SI_CN = 6
-O_CN = 3
-DEFAULT_COMPOSITION_RATIO = (1, 2)
+TI_ROLE = 6
+O_ROLE = 3
+ANGLE_BINS = np.linspace(0.0, 180.0, 10)
+CHEMISTRY_CUTOFF = 5.0
+MAX_TI_ATOMS = 32
+MAX_TI_NEIGHBORS = 16
+SHIFTS = np.asarray(
+    [[i, j, k] for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)],
+    dtype=float,
+)
+ZERO_SHIFT = int(np.flatnonzero(np.all(SHIFTS == 0, axis=1))[0])
+
+
+def _stable_logistic_switch(distances, cutoff, width):
+    """Numerically stable smooth neighbour-shell weights."""
+    scale = max(float(width), 0.03)
+    argument = np.clip(
+        (np.asarray(distances, dtype=float) - float(cutoff)) / scale,
+        -60.0,
+        60.0,
+    )
+    return 1.0 / (1.0 + np.exp(argument))
 
 
 def find_indexed_columns(columns, prefix):
     pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
-    return sorted(
-        int(match.group(1))
-        for column in columns
-        if (match := pattern.match(str(column)))
-    )
+    return sorted(int(m.group(1)) for c in columns if (m := pattern.match(str(c))))
 
 
 def validate_layout(df):
     missing = set(BASE_COLUMNS) - set(df.columns)
     if missing:
         raise ValueError(f"Missing base columns: {sorted(missing)}")
-    wp_indices = find_indexed_columns(df.columns, "wp")
-    target_indices = find_indexed_columns(df.columns, "target_coord")
-    if not wp_indices or wp_indices != list(range(len(wp_indices))):
-        raise ValueError(f"wp columns must be contiguous from wp0; found {wp_indices}")
-    if target_indices != wp_indices:
-        raise ValueError(
-            f"target_coord indices do not match wp indices: {target_indices} vs {wp_indices}"
-        )
-    for i in wp_indices:
+    wp = find_indexed_columns(df.columns, "wp")
+    target = find_indexed_columns(df.columns, "target_coord")
+    if not wp or wp != list(range(len(wp))) or target != wp:
+        raise ValueError(f"Invalid contiguous slot layout: wp={wp}, target={target}")
+    for i in wp:
         required = {f"wp{i}", f"x{i}", f"y{i}", f"z{i}", f"target_coord{i}"}
         missing = required - set(df.columns)
         if missing:
-            raise ValueError(f"Missing site columns for slot {i}: {sorted(missing)}")
-    return len(wp_indices)
+            raise ValueError(f"Missing slot-{i} columns: {sorted(missing)}")
+    return len(wp)
 
 
 def canonicalize_species_order(df, num_wps):
-    """Reorder each row as all Ti/CN6 sites, then O/CN3 sites, then padding."""
     output = df.copy()
-    allowed = {0, SI_CN, O_CN}
-    n_si_max = 0
-    n_o_max = 0
-    rows = []
-
+    rows, n_ti_max, n_o_max = [], 0, 0
     for row_index, row in df.iterrows():
-        si_sites = []
-        o_sites = []
+        ti, oxygen = [], []
         for i in range(num_wps):
             wp = int(row[f"wp{i}"])
-            cn = int(row[f"target_coord{i}"])
+            role = int(row[f"target_coord{i}"])
             xyz = tuple(float(row[f"{axis}{i}"]) for axis in "xyz")
-            if cn not in allowed:
-                raise ValueError(
-                    f"Row {row_index}, slot {i}: unsupported target_coord={cn}; "
-                    "factorized TiO2 expects only 6, 3, or 0."
-                )
-            if wp == -1:
-                if cn != 0:
-                    raise ValueError(
-                        f"Row {row_index}, slot {i}: wp=-1 requires target_coord=0."
-                    )
+            if wp < 0:
+                if role != 0:
+                    raise ValueError(f"Row {row_index}, slot {i}: padding role is not zero.")
                 continue
-            if cn == SI_CN:
-                si_sites.append((wp, xyz))
-            elif cn == O_CN:
-                o_sites.append((wp, xyz))
+            if role == TI_ROLE:
+                ti.append((wp, xyz))
+            elif role == O_ROLE:
+                oxygen.append((wp, xyz))
             else:
-                raise ValueError(
-                    f"Row {row_index}, slot {i}: occupied wp={wp} has target_coord=0."
-                )
-
-        if not si_sites or not o_sites:
-            raise ValueError(
-                f"Row {row_index} lacks one species: n_Ti={len(si_sites)}, n_O={len(o_sites)}"
-            )
-        n_si_max = max(n_si_max, len(si_sites))
-        n_o_max = max(n_o_max, len(o_sites))
-        rows.append((si_sites, o_sites))
-
-    for row_pos, (si_sites, o_sites) in enumerate(rows):
-        ordered = [(wp, xyz, SI_CN) for wp, xyz in si_sites]
-        ordered += [(wp, xyz, O_CN) for wp, xyz in o_sites]
+                raise ValueError(f"Row {row_index}, slot {i}: unsupported role {role}.")
+        if not ti or not oxygen:
+            raise ValueError(f"Row {row_index} does not contain both Ti and O blocks.")
+        n_ti_max, n_o_max = max(n_ti_max, len(ti)), max(n_o_max, len(oxygen))
+        rows.append((ti, oxygen))
+    for pos, (ti, oxygen) in enumerate(rows):
+        ordered = [(wp, xyz, TI_ROLE) for wp, xyz in ti]
+        ordered += [(wp, xyz, O_ROLE) for wp, xyz in oxygen]
         ordered += [(-1, (-1.0, -1.0, -1.0), 0)] * (num_wps - len(ordered))
-        idx = output.index[row_pos]
-        for i, (wp, xyz, cn) in enumerate(ordered):
+        idx = output.index[pos]
+        for i, (wp, xyz, role) in enumerate(ordered):
             output.at[idx, f"wp{i}"] = wp
-            output.at[idx, f"target_coord{i}"] = cn
+            output.at[idx, f"target_coord{i}"] = role
             for axis, value in zip("xyz", xyz):
                 output.at[idx, f"{axis}{i}"] = value
-
-    return output, n_si_max, n_o_max
+    return output, n_ti_max, n_o_max
 
 
 def encode_wp_token(values):
-    return "|".join(str(int(value)) for value in values)
+    return "|".join(str(int(v)) for v in values)
 
 
-def decode_wp_token(token, expected_slots, label):
-    parts = str(token).strip().split("|")
-    if len(parts) != expected_slots:
-        raise ValueError(
-            f"Malformed {label} token {token!r}: expected {expected_slots} entries."
-        )
-    try:
-        return [int(value) for value in parts]
-    except ValueError as exc:
-        raise ValueError(f"Malformed integer in {label} token {token!r}") from exc
+def decode_wp_token(token, expected_slots=None):
+    values = [int(x) for x in str(token).strip().split("|")]
+    if expected_slots is not None and len(values) != int(expected_slots):
+        raise ValueError(f"Token {token!r} has {len(values)} slots, expected {expected_slots}.")
+    return values
 
 
 def _wyckoff_free_parameters(spg, wp_index, xyz, row_label):
-    """Convert a generating coordinate to a padded 3-vector of free parameters.
-
-    PyXtal defines the exact parameterization through ``get_free_xyzs`` and
-    ``get_position_from_free_xyzs``. The returned vector is padded with zeros;
-    only the first ``wp.get_dof()`` entries are used during reconstruction.
-    """
     group = Group(int(spg))
-    if wp_index < 0 or wp_index >= len(group):
-        raise ValueError(
-            f"{row_label}: Wyckoff index {wp_index} is invalid for space group {spg}."
-        )
     wp = group[int(wp_index)]
     xyz = np.asarray(xyz, dtype=float)
     generator = wp.search_generator(xyz, tol=1e-2, symmetrize=True)
     if generator is None:
-        # Training coordinates may contain finite-precision displacement from
-        # the exact manifold. Project once, then require an exact generator.
-        projected = wp.project(xyz)
-        generator = wp.search_generator(projected, tol=1e-6, symmetrize=True)
+        generator = wp.search_generator(wp.project(xyz), tol=1e-6, symmetrize=True)
     if generator is None:
-        raise ValueError(
-            f"{row_label}: cannot map coordinate {xyz.tolist()} to "
-            f"{wp.get_label()} in space group {spg}."
-        )
+        raise ValueError(f"{row_label}: cannot map coordinate to {wp.get_label()}.")
     free = np.asarray(wp.get_free_xyzs(generator), dtype=float) % 1.0
-    dof = int(wp.get_dof())
-    if len(free) != dof:
-        raise RuntimeError(
-            f"{row_label}: PyXtal returned {len(free)} free parameters for "
-            f"{wp.get_label()}, expected {dof}."
-        )
     padded = np.zeros(3, dtype=float)
-    padded[:dof] = free
+    padded[: int(wp.get_dof())] = free
     return padded
 
 
-def _wyckoff_position_from_parameters(spg, wp_index, parameters):
-    """Reconstruct an exact generating coordinate from free parameters."""
-    group = Group(int(spg))
-    if wp_index < 0 or wp_index >= len(group):
-        raise ValueError(
-            f"Wyckoff index {wp_index} is invalid for space group {spg}."
-        )
-    wp = group[int(wp_index)]
+def _wyckoff_position_from_parameters(spg, wp_index, parameters, group=None):
+    wp = (group if group is not None else Group(int(spg)))[int(wp_index)]
     dof = int(wp.get_dof())
-    free = np.asarray(parameters, dtype=float)[:dof] % 1.0
-    xyz = np.asarray(wp.get_position_from_free_xyzs(free), dtype=float) % 1.0
-
-    # This is an invariant of the representation, not a tolerance-based repair.
-    check = wp.search_generator(xyz, tol=1e-7, symmetrize=False)
-    if check is None:
-        raise RuntimeError(
-            f"Internal Wyckoff reconstruction failure for spg={spg}, "
-            f"wp={wp_index}, dof={dof}, parameters={free.tolist()}."
-        )
-    return xyz
+    return np.asarray(
+        wp.get_position_from_free_xyzs(np.asarray(parameters, dtype=float)[:dof] % 1.0),
+        dtype=float,
+    ) % 1.0
 
 
-def build_factorized_blocks(df, num_wps, n_si_max, n_o_max):
-    """Build global/species blocks using free Wyckoff parameters.
-
-    Internal ``si_*`` columns store the Ti center block for compatibility.
-
-    The three continuous columns per site are retained for compatibility with
-    the existing VAE block layout, but they now mean ``u0,u1,u2``. Unused
-    entries are zero for occupied special positions and -1 for padded sites.
-    """
+def build_factorized_blocks(df, num_wps, n_ti_max, n_o_max):
     global_df = df[BASE_COLUMNS].copy()
-
-    si_records = []
-    o_records = []
+    ti_records, o_records = [], []
     for row_index, row in df.iterrows():
         spg = int(row["spg"])
-        si_slots = []
-        o_slots = []
+        ti, oxygen = [], []
         for i in range(num_wps):
-            cn = int(row[f"target_coord{i}"])
-            wp_index = int(row[f"wp{i}"])
-            if wp_index == -1:
+            wp = int(row[f"wp{i}"])
+            if wp < 0:
                 continue
+            role = int(row[f"target_coord{i}"])
             xyz = [float(row[f"{axis}{i}"]) for axis in "xyz"]
-            params = _wyckoff_free_parameters(
-                spg, wp_index, xyz, f"row {row_index}, slot {i}"
-            )
-            site = {"wp": wp_index, "u0": params[0], "u1": params[1], "u2": params[2]}
-            if cn == SI_CN:
-                si_slots.append(site)
-            elif cn == O_CN:
-                o_slots.append(site)
-
-        pad = {"wp": -1, "u0": -1.0, "u1": -1.0, "u2": -1.0}
-        si_slots += [pad.copy() for _ in range(n_si_max - len(si_slots))]
-        o_slots += [pad.copy() for _ in range(n_o_max - len(o_slots))]
-
-        si_record = {"si_skeleton_token": encode_wp_token(s["wp"] for s in si_slots)}
-        o_record = {"o_skeleton_token": encode_wp_token(s["wp"] for s in o_slots)}
-        for i, site in enumerate(si_slots):
+            free = _wyckoff_free_parameters(spg, wp, xyz, f"row {row_index}, slot {i}")
+            site = (wp, free)
+            (ti if role == TI_ROLE else oxygen).append(site)
+        ti += [(-1, np.full(3, -1.0))] * (n_ti_max - len(ti))
+        oxygen += [(-1, np.full(3, -1.0))] * (n_o_max - len(oxygen))
+        tr = {"si_skeleton_token": encode_wp_token(wp for wp, _ in ti)}
+        od = {"o_skeleton_token": encode_wp_token(wp for wp, _ in oxygen)}
+        for i, (_, free) in enumerate(ti):
             for j in range(3):
-                si_record[f"si_u{j}_{i}"] = site[f"u{j}"]
-        for i, site in enumerate(o_slots):
+                tr[f"si_u{j}_{i}"] = float(free[j])
+        for i, (_, free) in enumerate(oxygen):
             for j in range(3):
-                o_record[f"o_u{j}_{i}"] = site[f"u{j}"]
-        si_records.append(si_record)
-        o_records.append(o_record)
-
-    return global_df, pd.DataFrame(si_records), pd.DataFrame(o_records)
+                od[f"o_u{j}_{i}"] = float(free[j])
+        ti_records.append(tr); o_records.append(od)
+    return global_df, pd.DataFrame(ti_records), pd.DataFrame(o_records)
 
 
-def blocks_to_si_rows(global_df, si_df, num_wps, n_si_max):
-    """Reconstruct only the Si block for pre-oxygen screening.
+def _cell_matrix(parameters):
+    a, b, c, alpha, beta, gamma = map(float, parameters)
+    ca, cb, cg, sg = np.cos(alpha), np.cos(beta), np.cos(gamma), np.sin(gamma)
+    if min(a, b, c) <= 0 or abs(sg) < 1e-8:
+        raise ValueError("Invalid cell parameters.")
+    y3 = c * (ca - cb * cg) / sg
+    z2 = c * c - (c * cb) ** 2 - y3 ** 2
+    if z2 <= 1e-10:
+        raise ValueError("Non-positive cell metric.")
+    return np.asarray([[a, 0, 0], [b * cg, b * sg, 0], [c * cb, y3, np.sqrt(z2)]])
 
-    Returns the LEGO-like rows and their source positions in the input blocks.
-    """
-    if len(global_df) != len(si_df):
-        raise ValueError("Sampled global and Si block row counts differ.")
-    records, source_positions = [], []
-    rejected_reconstruction = 0
-    for row_index in range(len(global_df)):
-        global_row = global_df.iloc[row_index]
-        spg = int(round(float(global_row["spg"])))
-        si_row = si_df.iloc[row_index]
-        try:
-            si_wps = decode_wp_token(
-                si_row["si_skeleton_token"], n_si_max, "Si skeleton"
-            )
-            reconstructed = []
-            for i, wp_index in enumerate(si_wps):
-                if wp_index < 0:
+
+def _deduplicate_fractional(frac, tol=1e-6):
+    unique = []
+    for point in np.asarray(frac, dtype=float).reshape(-1, 3) % 1.0:
+        if not any(np.linalg.norm((point - other) - np.round(point - other)) <= tol
+                   for other in unique):
+            unique.append(point)
+    return np.asarray(unique, dtype=float).reshape(-1, 3)
+
+
+
+
+def periodic_neighbor_vectors(frac, cell):
+    frac = np.asarray(frac, dtype=float)
+    delta = frac[:, None, None, :] - frac[None, :, None, :] + SHIFTS[None, None, :, :]
+    cart = np.einsum("...i,ij->...j", delta, cell)
+    dist = np.linalg.norm(cart, axis=-1)
+    ids = np.arange(len(frac)); dist[ids, ids, ZERO_SHIFT] = np.inf
+    vectors, distances = [], []
+    for i in range(len(frac)):
+        d = dist[i].reshape(-1)
+        v = cart[i].reshape(-1, 3)
+        mask = np.isfinite(d) & (d > 1e-6)
+        order = np.argsort(d[mask])
+        distances.append(d[mask][order]); vectors.append(v[mask][order])
+    return distances, vectors
+
+
+
+
+def soft_angle_hist(distances, vectors, cutoff, width, bins=ANGLE_BINS):
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    sigma = max(float(np.diff(bins).mean()) * 0.45, 2.0)
+    histogram = np.zeros(len(centers), dtype=float)
+    for d, v in zip(distances, vectors):
+        weights = _stable_logistic_switch(d, cutoff, width)
+        keep = np.flatnonzero(weights > 0.05)
+        for ii in range(len(keep)):
+            i = keep[ii]
+            ni = np.linalg.norm(v[i])
+            for jj in range(ii + 1, len(keep)):
+                j = keep[jj]
+                nj = np.linalg.norm(v[j])
+                if ni <= 1e-10 or nj <= 1e-10:
                     continue
-                params = [float(si_row[f"si_u{j}_{i}"]) for j in range(3)]
-                xyz = _wyckoff_position_from_parameters(spg, wp_index, params)
-                reconstructed.append((wp_index, xyz.tolist(), SI_CN))
-            if not reconstructed or len(reconstructed) > num_wps:
-                raise ValueError("Invalid occupied Si-site count.")
-            record = {column: global_row[column] for column in BASE_COLUMNS}
-            padded = [(-1, [-1.0, -1.0, -1.0], 0)] * (
-                num_wps - len(reconstructed)
-            )
-            for i, (wp_index, xyz, cn) in enumerate(reconstructed + padded):
-                record[f"wp{i}"] = int(wp_index)
-                record[f"x{i}"], record[f"y{i}"], record[f"z{i}"] = xyz
-                record[f"target_coord{i}"] = int(cn)
-            records.append(record)
-            source_positions.append(row_index)
-        except Exception:
-            rejected_reconstruction += 1
-    return pd.DataFrame(records), np.asarray(source_positions, dtype=int), rejected_reconstruction
+                angle = np.degrees(np.arccos(np.clip(np.dot(v[i], v[j]) / (ni * nj), -1, 1)))
+                histogram += weights[i] * weights[j] * np.exp(-0.5 * ((centers - angle) / sigma) ** 2)
+    return histogram / max(histogram.sum(), 1e-12)
 
 
-def blocks_to_lego_rows_with_map(
-    global_df, si_df, o_df, num_wps, n_si_max, n_o_max
-):
-    """Full reconstruction plus source-row mapping for repeated O proposals."""
-    if not (len(global_df) == len(si_df) == len(o_df)):
-        raise ValueError("Sampled block row counts differ.")
-    records, source_positions = [], []
-    rejected_overflow = rejected_reconstruction = 0
-    for row_index in range(len(global_df)):
-        global_row = global_df.iloc[row_index]
-        spg = int(round(float(global_row["spg"])))
-        si_row, o_row = si_df.iloc[row_index], o_df.iloc[row_index]
-        try:
-            si_wps = decode_wp_token(si_row["si_skeleton_token"], n_si_max, "Si skeleton")
-            o_wps = decode_wp_token(o_row["o_skeleton_token"], n_o_max, "O skeleton")
-            sites = []
-            for i, wp_index in enumerate(si_wps):
-                params = [float(si_row[f"si_u{j}_{i}"]) for j in range(3)]
-                sites.append((wp_index, params, SI_CN))
-            for i, wp_index in enumerate(o_wps):
-                params = [float(o_row[f"o_u{j}_{i}"]) for j in range(3)]
-                sites.append((wp_index, params, O_CN))
-            occupied = [(wp, params, cn) for wp, params, cn in sites if wp != -1]
-            if len(occupied) > num_wps:
-                rejected_overflow += 1
-                continue
-            reconstructed = []
-            for wp_index, params, cn in occupied:
-                xyz = _wyckoff_position_from_parameters(spg, wp_index, params)
-                reconstructed.append((wp_index, xyz.tolist(), cn))
-            record = {column: global_row[column] for column in BASE_COLUMNS}
-            padded = [(-1, [-1.0, -1.0, -1.0], 0)] * (num_wps - len(reconstructed))
-            for i, (wp_index, xyz, cn) in enumerate(reconstructed + padded):
-                record[f"wp{i}"] = int(wp_index)
-                record[f"x{i}"], record[f"y{i}"], record[f"z{i}"] = xyz
-                record[f"target_coord{i}"] = int(cn)
-            records.append(record)
-            source_positions.append(row_index)
-        except Exception:
-            rejected_reconstruction += 1
-    return (pd.DataFrame(records), np.asarray(source_positions, dtype=int),
-            rejected_overflow, rejected_reconstruction)
-
-
-def subset_si_state(state, indices):
-    """Take a stable subset of a fixed-Si sampler state."""
-    idx = np.asarray(indices, dtype=int)
+def framework_descriptor(frac, cell, chemistry_cutoff=CHEMISTRY_CUTOFF):
+    """Global Ti-community chemistry under the hard radial cutoff."""
+    distances, vectors = periodic_neighbor_vectors(frac, cell)
+    cutoff = float(chemistry_cutoff)
+    shell_values = np.concatenate([d[d <= cutoff] for d in distances])
+    if shell_values.size == 0:
+        raise ValueError("No Ti neighbours inside the chemistry cutoff.")
+    cn_values = np.asarray([np.count_nonzero(d <= cutoff) for d in distances], dtype=float)
+    nn_mean = float(np.mean(shell_values))
+    nn_width = max(float(np.std(shell_values)), 0.03)
+    angle = soft_angle_hist(distances, vectors, cutoff, max(nn_width, 0.08))
+    all_nearest = np.asarray([d[0] for d in distances], dtype=float)
+    lengths = np.linalg.norm(cell, axis=1)
+    volume = abs(float(np.linalg.det(cell)))
     return {
-        "z": np.asarray(state["z"])[idx],
-        "global_x": np.asarray(state["global_x"])[idx],
-        "si_x": np.asarray(state["si_x"])[idx],
-        "global_df": state["global_df"].iloc[idx].reset_index(drop=True),
-        "si_df": state["si_df"].iloc[idx].reset_index(drop=True),
-        "valid_mask": np.ones(len(idx), dtype=bool),
-        "stats": state.get("stats", {}),
-        "max_independent_sites": state.get("max_independent_sites"),
+        "target_ti_cn": float(np.mean(cn_values)),
+        "target_ti_nn_mean": nn_mean,
+        "target_ti_nn_width": nn_width,
+        "target_ti_shell_cutoff": cutoff,
+        "target_ti_sphere_radius": 0.45 * float(np.percentile(all_nearest, 5)),
+        "minimum_ti_ti_distance": float(np.min(all_nearest)),
+        "volume_per_ti": volume / len(frac),
+        "aspect_ratio": float(lengths.max() / max(lengths.min(), 1e-12)),
+        "angle_profile": angle,
+        "n_ti": int(len(frac)),
     }
 
 
-def blocks_to_lego_rows(global_df, si_df, o_df, num_wps, n_si_max, n_o_max):
-    """Reconstruct exact Wyckoff coordinates and emit standard LEGO rows."""
-    if not (len(global_df) == len(si_df) == len(o_df)):
-        raise ValueError("Sampled block row counts differ.")
+def ti_skeleton_from_row(row, num_wps):
+    return [int(row[f"wp{i}"]) for i in range(num_wps)
+            if int(row[f"wp{i}"]) >= 0 and int(row[f"target_coord{i}"]) == TI_ROLE]
 
-    records = []
-    rejected_overflow = 0
-    rejected_reconstruction = 0
-    for row_index in range(len(global_df)):
-        global_row = global_df.iloc[row_index]
-        spg = int(round(float(global_row["spg"])))
-        si_row = si_df.iloc[row_index]
-        o_row = o_df.iloc[row_index]
-        si_wps = decode_wp_token(si_row["si_skeleton_token"], n_si_max, "Si skeleton")
-        o_wps = decode_wp_token(o_row["o_skeleton_token"], n_o_max, "O skeleton")
 
-        sites = []
-        for i, wp_index in enumerate(si_wps):
-            params = [float(si_row[f"si_u{j}_{i}"]) for j in range(3)]
-            sites.append((wp_index, params, SI_CN))
-        for i, wp_index in enumerate(o_wps):
-            params = [float(o_row[f"o_u{j}_{i}"]) for j in range(3)]
-            sites.append((wp_index, params, O_CN))
-
-        occupied = [(wp, params, cn) for wp, params, cn in sites if wp != -1]
-        if len(occupied) > num_wps:
-            rejected_overflow += 1
-            continue
-
-        reconstructed = []
-        try:
-            for wp_index, params, cn in occupied:
-                xyz = _wyckoff_position_from_parameters(spg, wp_index, params)
-                reconstructed.append((wp_index, xyz.tolist(), cn))
-        except (ValueError, RuntimeError, IndexError):
-            rejected_reconstruction += 1
-            continue
-
-        record = {column: global_row[column] for column in BASE_COLUMNS}
-        padded = [(-1, [-1.0, -1.0, -1.0], 0)] * (num_wps - len(reconstructed))
-        for i, (wp_index, xyz, cn) in enumerate(reconstructed + padded):
-            record[f"wp{i}"] = int(wp_index)
-            record[f"x{i}"], record[f"y{i}"], record[f"z{i}"] = xyz
-            record[f"target_coord{i}"] = int(cn)
-        records.append(record)
-
-    return pd.DataFrame(records), rejected_overflow, rejected_reconstruction
-
-def restore_dtypes(df, training_df, num_wps, discrete_cell, discrete_coordinates):
-    output = df.copy()
-    integer_columns = ["spg"]
-    if discrete_cell:
-        integer_columns += ["a", "b", "c", "alpha", "beta", "gamma"]
+def ti_framework_from_row(row, num_wps):
+    spg = int(row["spg"])
+    group = Group(spg)
+    frac = []
     for i in range(num_wps):
-        integer_columns += [f"wp{i}", f"target_coord{i}"]
-        if discrete_coordinates:
-            integer_columns += [f"x{i}", f"y{i}", f"z{i}"]
-    for column in output.columns:
-        output[column] = pd.to_numeric(output[column], errors="raise")
-        if column in integer_columns:
-            output[column] = np.rint(output[column]).astype(int)
-        else:
-            output[column] = output[column].astype(float)
-    return output.loc[:, training_df.columns]
+        if int(row[f"target_coord{i}"]) != TI_ROLE:
+            continue
+        wp_index = int(row[f"wp{i}"])
+        generator = np.asarray([row[f"x{i}"], row[f"y{i}"], row[f"z{i}"]], dtype=float)
+        orbit = _deduplicate_fractional([op.operate(generator) for op in group[wp_index].ops])
+        frac.extend(orbit.tolist())
+    return _deduplicate_fractional(frac), _cell_matrix(row[BASE_COLUMNS[1:]].to_numpy(float))
+
+
+def framework_fingerprint(frac, cell):
+    distances, _ = periodic_neighbor_vectors(frac, cell)
+    values = np.sort(np.concatenate([d[: min(12, len(d))] for d in distances]))
+    rounded = np.round(values, 3).tobytes()
+    return hashlib.sha1(rounded).hexdigest()[:16]
 
 
 
-class SiAwareOxygenFirstShellGeometry:
-    """Differentiable Si-fixed oxygen first-shell objective.
+CHEMISTRY_CACHE_VERSION = 2
 
-    The training row supplies the crystallographic skeleton and the target
-    ordered first-shell distances.  Predicted cell and Si coordinates are
-    reconstructed, then detached.  Gradients therefore flow only through the
-    oxygen free parameters.  The objective matches Si->O d1/d4/d5 and O->Si
-    d1/d2/d3, directly representing SiO4 completion and OSi2 bridging while
-    keeping the first unwanted neighbour outside the shell.
+
+def _extract_training_record(payload):
+    row_index, row_dict, num_wps, chemistry_cutoff, has_label = payload
+    row = pd.Series(row_dict)
+    try:
+        frac, cell = ti_framework_from_row(row, num_wps)
+        descriptor = framework_descriptor(frac, cell, chemistry_cutoff=chemistry_cutoff)
+        wps = ti_skeleton_from_row(row, num_wps)
+        group = Group(int(row["spg"]))
+        source = str(row["label"]) if has_label else framework_fingerprint(frac, cell)
+        record = {
+            "training_row": int(row_index),
+            "source_group": source,
+            "spg": int(row["spg"]),
+            "lattice_type": str(group.lattice_type),
+            "ti_skeleton_token_unpadded": encode_wp_token(wps),
+            "ti_multiplicities": encode_wp_token(group[wp].multiplicity for wp in wps),
+            **{k: v for k, v in descriptor.items() if k != "angle_profile"},
+        }
+        for i, value in enumerate(descriptor["angle_profile"]):
+            record[f"angle_bin_{i}"] = float(value)
+        return record, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _cpu_affinity_count():
+    """Return CPUs available to this process after Slurm/cgroup binding."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, int(os.cpu_count() or 1))
+
+
+def resolve_ncpu(requested, reserve_for_scheduler=1):
+    """Resolve CPU worker count from an explicit value or the active allocation.
+
+    Automatic mode (requested <= 0) prefers SLURM_CPUS_PER_TASK, caps it by
+    the process CPU affinity, and reserves one CPU for the scheduler/main
+    process.  An explicit positive value is treated as the requested worker
+    count but is still capped by the CPUs actually available to the process.
     """
+    affinity = _cpu_affinity_count()
+    slurm_raw = os.environ.get("SLURM_CPUS_PER_TASK")
+    try:
+        allocated = int(slurm_raw) if slurm_raw is not None else affinity
+    except ValueError:
+        allocated = affinity
+    allocated = max(1, min(allocated, affinity))
 
-    METRIC_WEIGHTS = {
-        "si_d1": 0.5, "si_d4": 1.0, "si_d5": 1.0,
-        "o_d1": 0.5, "o_d2": 1.0, "o_d3": 1.0,
-    }
+    requested = 0 if requested is None else int(requested)
+    if requested < 0:
+        raise ValueError("--ncpu cannot be negative.")
+    if requested == 0:
+        return max(1, allocated - max(0, int(reserve_for_scheduler)))
+    return max(1, min(requested, allocated))
 
-    def __init__(self, canonical_df, n_si_max, n_o_max):
-        self.rows = []
-        self.n_si_max = int(n_si_max)
-        self.n_o_max = int(n_o_max)
+
+def set_worker_thread_limits():
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(key, "1")
+
+
+class TiTrainingDistribution:
+    def __init__(self, canonical_df, num_wps, chemistry_cutoff=CHEMISTRY_CUTOFF,
+                 ncpu=1, cache_csv=None, cache_meta=None, cache_key=None):
+        self.rng = np.random.default_rng(0)
+        if cache_csv and cache_meta and os.path.exists(cache_csv) and os.path.exists(cache_meta):
+            try:
+                with open(cache_meta, "r", encoding="utf-8") as handle:
+                    meta = json.load(handle)
+                if meta.get("cache_key") == cache_key and meta.get("version") == CHEMISTRY_CACHE_VERSION:
+                    self.frame = pd.read_csv(cache_csv)
+                    self.failures = int(meta.get("failures", 0))
+                    self.source_groups = self.frame.groupby("source_group", sort=False).indices
+                    print(f"Reused Ti chemistry cache: {cache_csv}", flush=True)
+                    return
+            except Exception as exc:
+                print(f"Ignoring invalid chemistry cache: {type(exc).__name__}: {exc}", flush=True)
+
+        records, failures = [], 0
+        payloads = [
+            (int(idx), row.to_dict(), int(num_wps), float(chemistry_cutoff), "label" in canonical_df.columns)
+            for idx, row in canonical_df.iterrows()
+        ]
+        total = len(payloads)
+        print(f"Extracting Ti chemistry from {total} training rows with {ncpu} CPU worker(s)...", flush=True)
+        if int(ncpu) == 1:
+            iterator = map(_extract_training_record, payloads)
+            for done, (record, error) in enumerate(iterator, 1):
+                if record is None: failures += 1
+                else: records.append(record)
+                if done % 500 == 0 or done == total:
+                    print(f"Ti chemistry extraction: {done}/{total}; valid={len(records)}; failures={failures}", flush=True)
+        else:
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=int(ncpu), mp_context=ctx,
+                                     initializer=set_worker_thread_limits) as pool:
+                iterator = pool.map(_extract_training_record, payloads, chunksize=8)
+                for done, (record, error) in enumerate(iterator, 1):
+                    if record is None: failures += 1
+                    else: records.append(record)
+                    if done % 500 == 0 or done == total:
+                        print(f"Ti chemistry extraction: {done}/{total}; valid={len(records)}; failures={failures}", flush=True)
+        if not records:
+            raise RuntimeError("No valid Ti-framework chemistry records could be extracted.")
+        self.frame = pd.DataFrame(records).sort_values("training_row").reset_index(drop=True)
+        self.failures = failures
+        self.source_groups = self.frame.groupby("source_group", sort=False).indices
+        if cache_csv and cache_meta:
+            self.frame.to_csv(cache_csv, index=False)
+            with open(cache_meta, "w", encoding="utf-8") as handle:
+                json.dump({"version": CHEMISTRY_CACHE_VERSION, "cache_key": cache_key,
+                           "failures": failures}, handle, indent=2)
+
+    def save(self, path):
+        self.frame.to_csv(path, index=False)
+
+    def _row_to_target(self, row):
+        angle = np.asarray([row[f"angle_bin_{i}"] for i in range(len(ANGLE_BINS) - 1)], dtype=float)
+        return TiChemistryTarget(
+            source_group=str(row.source_group), target_ti_cn=float(row.target_ti_cn),
+            target_ti_nn_mean=float(row.target_ti_nn_mean),
+            target_ti_nn_width=float(row.target_ti_nn_width),
+            target_ti_shell_cutoff=float(row.target_ti_shell_cutoff),
+            target_ti_sphere_radius=float(row.target_ti_sphere_radius),
+            target_volume_per_ti=float(row.volume_per_ti), angle_profile=angle,
+        )
+
+    def sample_any(self, rng):
+        source = rng.choice(self.frame.source_group.unique())
+        subset = self.frame[self.frame.source_group == source]
+        return self._row_to_target(subset.iloc[int(rng.integers(0, len(subset)))])
+
+    def sample(self, spg, padded_token, rng):
+        wps = [w for w in decode_wp_token(padded_token) if w >= 0]
+        token = encode_wp_token(wps)
+        group = Group(int(spg))
+        multiplicities = encode_wp_token(group[w].multiplicity for w in wps)
+        lattice_type = str(group.lattice_type)
+        levels = [
+            (self.frame.spg == int(spg)) & (self.frame.ti_skeleton_token_unpadded == token),
+            (self.frame.lattice_type == lattice_type) & (self.frame.ti_multiplicities == multiplicities),
+            self.frame.ti_multiplicities == multiplicities,
+            np.ones(len(self.frame), dtype=bool),
+        ]
+        for mask in levels:
+            candidates = self.frame.loc[mask]
+            if len(candidates): break
+        source = rng.choice(candidates.source_group.unique())
+        subset = candidates[candidates.source_group == source]
+        return self._row_to_target(subset.iloc[int(rng.integers(0, len(subset)))])
+
+
+@dataclass(frozen=True)
+class TiChemistryTarget:
+    source_group: str
+    target_ti_cn: float
+    target_ti_nn_mean: float
+    target_ti_nn_width: float
+    target_ti_shell_cutoff: float
+    target_ti_sphere_radius: float
+    target_volume_per_ti: float
+    angle_profile: np.ndarray
+
+
+class TorchSymmetryConstrainedTiBuilder:
+    """Optimize symmetry-allowed lattice and Wyckoff variables with autograd."""
+
+    def __init__(
+        self,
+        initializations=16,
+        screen_steps=30,
+        refine_starts=4,
+        refine_steps=60,
+        cn_tolerance=0.75,
+        minimum_distance=2.0,
+        maximum_loss=5.0,
+        chemistry_cutoff=CHEMISTRY_CUTOFF,
+        max_ti_atoms=MAX_TI_ATOMS,
+        max_neighbors=MAX_TI_NEIGHBORS,
+        lr=0.06,
+        device=None,
+        seed=42,
+    ):
+        self.initializations = int(initializations)
+        self.screen_steps = int(screen_steps)
+        self.refine_starts = int(refine_starts)
+        self.refine_steps = int(refine_steps)
+        self.cn_tolerance = float(cn_tolerance)
+        self.minimum_distance = float(minimum_distance)
+        self.maximum_loss = float(maximum_loss)
+        self.chemistry_cutoff = float(chemistry_cutoff)
+        self.max_ti_atoms = int(max_ti_atoms)
+        self.max_neighbors = int(max_neighbors)
+        self.lr = float(lr)
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.rng = np.random.default_rng(seed)
         self._template_cache = {}
-        nslots = sum(str(c).startswith("wp") for c in canonical_df.columns)
-        for _, row in canonical_df.iterrows():
-            spg = int(row["spg"])
-            si_wps, o_wps, teacher_si, teacher_o = [], [], [], []
-            group = Group(spg)
-            for i in range(nslots):
-                wp_index = int(row.get(f"wp{i}", -1))
-                cn = int(row.get(f"target_coord{i}", 0))
-                if wp_index < 0:
-                    continue
-                generator = np.asarray(
-                    [row[f"x{i}"], row[f"y{i}"], row[f"z{i}"]], dtype=float
-                )
-                wp = group[wp_index]
-                positions = np.asarray(
-                    [op.operate(generator) for op in wp.ops], dtype=float
-                ) % 1.0
-                positions = _deduplicate_fractional_positions(positions)
-                if cn == SI_CN:
-                    si_wps.append(wp_index); teacher_si.append(positions)
-                elif cn == O_CN:
-                    o_wps.append(wp_index); teacher_o.append(positions)
-            if not teacher_si or not teacher_o:
-                self.rows.append(None)
-                continue
-            cell = _cell_matrix_numpy(row)
-            teacher_si = np.concatenate(teacher_si, axis=0).astype(np.float32)
-            teacher_o = np.concatenate(teacher_o, axis=0).astype(np.float32)
-            targets = self._ordered_numpy(teacher_si, teacher_o, cell)
-            if targets is None:
-                self.rows.append(None)
-                continue
-            self.rows.append((spg, si_wps, o_wps, targets))
+        self._shifts = torch.as_tensor(SHIFTS, dtype=torch.float32, device=self.device)
 
     @staticmethod
-    def _op_parts(op):
-        rot = getattr(op, "rotation_matrix", None)
-        trans = getattr(op, "translation_vector", None)
-        if rot is None or trans is None:
-            affine = np.asarray(getattr(op, "affine_matrix"), dtype=float)
-            rot, trans = affine[:3, :3], affine[:3, 3]
-        return np.asarray(rot, dtype=float), np.asarray(trans, dtype=float)
+    def _lattice_spec(lattice_type):
+        lt = str(lattice_type).lower()
+        if lt == "cubic": return ("a",)
+        if lt in {"tetragonal", "hexagonal", "trigonal"}: return ("a", "c")
+        if lt == "orthorhombic": return ("a", "b", "c")
+        if lt == "monoclinic": return ("a", "b", "c", "beta")
+        return ("a", "b", "c", "alpha", "beta", "gamma")
 
-    def _site_template(self, spg, wp_index):
-        key = (int(spg), int(wp_index))
+    @staticmethod
+    def _affine_map(function, dof):
+        zero = np.asarray(function(np.zeros(dof)), dtype=float)
+        matrix = np.zeros((3, dof), dtype=float)
+        for k in range(dof):
+            x = np.zeros(dof); x[k] = 0.137
+            y = np.asarray(function(x), dtype=float)
+            delta = (y - zero + 0.5) % 1.0 - 0.5
+            matrix[:, k] = delta / 0.137
+        return matrix, zero
+
+    def _template(self, spg, padded_token, target):
+        key = (int(spg), str(padded_token))
         if key in self._template_cache:
             return self._template_cache[key]
-        wp = Group(int(spg))[int(wp_index)]
-        dof = int(wp.get_dof())
-        u0 = np.full(dof, 0.271, dtype=float)
-        base = np.asarray(wp.get_position_from_free_xyzs(u0), dtype=float)
-        A = np.zeros((3, 3), dtype=float)
-        eps = 1e-5
-        for j in range(dof):
-            uj = u0.copy(); uj[j] += eps
-            pos = np.asarray(wp.get_position_from_free_xyzs(uj), dtype=float)
-            delta = pos - base; delta -= np.round(delta)
-            A[:, j] = delta / eps
-        b = base - A[:, :dof] @ u0
-        mats, offs = [], []
-        for op in wp.ops:
-            R, t = self._op_parts(op)
-            mats.append(R @ A); offs.append(R @ b + t)
-        result = (np.asarray(mats, np.float32), np.asarray(offs, np.float32))
-        self._template_cache[key] = result
-        return result
-
-    @staticmethod
-    def _continuous_layout(transformer):
-        layout, st = {}, 0
-        for info in transformer._column_transform_info_list:
-            ed = st + info.output_dimensions
-            if info.column_type == "continuous":
-                layout[info.column_name] = (st, ed, info.transform)
-            st = ed
-        return layout
-
-    @staticmethod
-    def _gm_parameters(gm):
-        bgm = getattr(gm, "_bgm_transformer", None) or getattr(gm, "_model", None)
-        means = np.asarray(getattr(bgm, "means_"), dtype=float).reshape(-1)
-        cov = np.asarray(getattr(bgm, "covariances_"), dtype=float).reshape(-1)
-        valid = np.asarray(gm.valid_component_indicator, dtype=bool)
-        return means[valid], np.sqrt(cov[valid])
-
-    def _raw_parameters(self, logits, transformer, prefix, nslots):
-        layout = self._continuous_layout(transformer)
-        values = []
-        for i in range(nslots):
-            slot = []
-            for j in range(3):
-                st, ed, gm = layout[f"{prefix}_u{j}_{i}"]
-                norm = torch.tanh(logits[:, st])
-                probs = torch.softmax(logits[:, st + 1:ed], dim=-1)
-                means, stds = self._gm_parameters(gm)
-                means = torch.as_tensor(means, device=logits.device, dtype=logits.dtype)
-                stds = torch.as_tensor(stds, device=logits.device, dtype=logits.dtype)
-                raw = norm[:, None] * (4.0 * stds[None, :]) + means[None, :]
-                slot.append((probs * raw).sum(dim=1))
-            values.append(torch.stack(slot, dim=1))
-        return torch.stack(values, dim=1)
-
-    def _raw_continuous_columns(self, logits, transformer, names):
-        layout = self._continuous_layout(transformer)
-        values = []
-        for name in names:
-            st, ed, gm = layout[name]
-            norm = torch.tanh(logits[:, st])
-            probs = torch.softmax(logits[:, st + 1:ed], dim=-1)
-            means, stds = self._gm_parameters(gm)
-            means = torch.as_tensor(means, device=logits.device, dtype=logits.dtype)
-            stds = torch.as_tensor(stds, device=logits.device, dtype=logits.dtype)
-            raw = norm[:, None] * (4.0 * stds[None, :]) + means[None, :]
-            values.append((probs * raw).sum(dim=1))
-        return torch.stack(values, dim=1)
-
-    @staticmethod
-    def _torch_cell_matrix(parameters):
-        a, b, c, alpha, beta, gamma = parameters.unbind(dim=-1)
-        a, b, c = a.clamp_min(.25), b.clamp_min(.25), c.clamp_min(.25)
-        ca, cb, cg, sg = torch.cos(alpha), torch.cos(beta), torch.cos(gamma), torch.sin(gamma)
-        sg = torch.where(sg.abs() < 1e-4, torch.sign(sg + 1e-8) * 1e-4, sg)
-        vt = (1 + 2*ca*cb*cg - ca.square() - cb.square() - cg.square()).clamp_min(1e-8)
-        z = torch.zeros_like(a)
-        return torch.stack([
-            torch.stack([a,z,z],-1),
-            torch.stack([b*cg,b*sg,z],-1),
-            torch.stack([c*cb,c*(ca-cb*cg)/sg,c*torch.sqrt(vt)/sg],-1),
-        ], dim=-2)
-
-    @staticmethod
-    def _periodic_distance_tensor(sf, of, cell):
-        """Distances for every Si/O pair and all 27 periodic images.
-
-        The image axis must remain explicit until neighbour ranking.  Taking a
-        minimum over images first is incorrect for primitive cells: several
-        physical first-shell neighbours may be periodic copies of the same
-        atom stored in the central cell.
-        """
-        shifts = torch.as_tensor(
-            [[i, j, k] for i in (-1, 0, 1)
-             for j in (-1, 0, 1) for k in (-1, 0, 1)],
-            device=sf.device,
-            dtype=sf.dtype,
-        )
-        delta = (
-            sf[:, None, None, :]
-            - of[None, :, None, :]
-            + shifts[None, None, :, :]
-        )
-        cart = torch.einsum("ijsq,qr->ijsr", delta, cell)
-        return torch.linalg.norm(cart, dim=-1)
-
-    @classmethod
-    def _ordered_torch(cls, sf, of, cell):
-        dist = cls._periodic_distance_tensor(sf, of, cell)
-        # For each central Si, rank all O atoms in all 27 images.
-        si_all = dist.reshape(dist.shape[0], -1)
-        # For each central O, rank all Si atoms in all 27 images.
-        o_all = dist.permute(1, 0, 2).reshape(dist.shape[1], -1)
-        if si_all.shape[1] < 5 or o_all.shape[1] < 3:
+        group = Group(int(spg))
+        wps = tuple(w for w in decode_wp_token(padded_token) if w >= 0)
+        if not wps:
             return None
-        si5 = torch.topk(si_all, k=5, dim=1, largest=False, sorted=True).values
-        o3 = torch.topk(o_all, k=3, dim=1, largest=False, sorted=True).values
-        return {
-            "si_d1": si5[:, 0], "si_d4": si5[:, 3], "si_d5": si5[:, 4],
-            "o_d1": o3[:, 0], "o_d2": o3[:, 1], "o_d3": o3[:, 2],
-        }
-
-    @classmethod
-    def _ordered_numpy(cls, sf, of, cell):
-        shifts = np.asarray(
-            [[i, j, k] for i in (-1, 0, 1)
-             for j in (-1, 0, 1) for k in (-1, 0, 1)],
-            dtype=float,
-        )
-        delta = (
-            sf[:, None, None, :]
-            - of[None, :, None, :]
-            + shifts[None, None, :, :]
-        )
-        dist = np.linalg.norm(
-            np.einsum("...i,ij->...j", delta, cell), axis=-1
-        )
-        si_all = dist.reshape(len(sf), -1)
-        o_all = np.transpose(dist, (1, 0, 2)).reshape(len(of), -1)
-        if si_all.shape[1] < 5 or o_all.shape[1] < 3:
+        n_ti = sum(int(group[w].multiplicity) for w in wps)
+        if n_ti < 2 or n_ti > self.max_ti_atoms:
             return None
-        si = np.sort(si_all, axis=1)[:, :5]
-        oo = np.sort(o_all, axis=1)[:, :3]
-        return {
-            "si_d1": si[:, 0], "si_d4": si[:, 3], "si_d5": si[:, 4],
-            "o_d1": oo[:, 0], "o_d2": oo[:, 1], "o_d3": oo[:, 2],
+        spec = self._lattice_spec(group.lattice_type)
+        site_dofs=[]; orbit_rot=[]; orbit_trans=[]; gen_A=[]; gen_b=[]
+        for w in wps:
+            wp=group[w]; dof=int(wp.get_dof()); site_dofs.append(dof)
+            A,b=self._affine_map(lambda u, wp=wp: wp.get_position_from_free_xyzs(u), dof)
+            gen_A.append(A); gen_b.append(b)
+            rots=[]; trans=[]
+            for op in wp.ops:
+                o=np.asarray(op.operate([0.,0.,0.]),float)
+                cols=[]
+                for axis in range(3):
+                    e=np.zeros(3); e[axis]=0.173
+                    q=np.asarray(op.operate(e),float)
+                    cols.append(((q-o+0.5)%1.0-0.5)/0.173)
+                rots.append(np.stack(cols,axis=1)); trans.append(o)
+            orbit_rot.append(np.asarray(rots,float)); orbit_trans.append(np.asarray(trans,float))
+        template={
+            'spg':int(spg),'group':group,'wps':wps,'spec':spec,
+            'lattice_type':str(group.lattice_type).lower(),'site_dofs':tuple(site_dofs),
+            'gen_A':[torch.tensor(x,dtype=torch.float32,device=self.device) for x in gen_A],
+            'gen_b':[torch.tensor(x,dtype=torch.float32,device=self.device) for x in gen_b],
+            'orbit_rot':[torch.tensor(x,dtype=torch.float32,device=self.device) for x in orbit_rot],
+            'orbit_trans':[torch.tensor(x,dtype=torch.float32,device=self.device) for x in orbit_trans],
+            'n_ti':n_ti,
         }
+        self._template_cache[key]=template
+        return template
 
-    def __call__(self, row_ids, global_logits, si_logits, o_logits,
-                 global_transformer, si_transformer, o_transformer, device):
-        cells = self._torch_cell_matrix(self._raw_continuous_columns(
-            global_logits, global_transformer,
-            ["a","b","c","alpha","beta","gamma"],
-        )).detach()
-        # Detach Si: oxygen must adapt to the already established framework.
-        si_u = self._raw_parameters(si_logits, si_transformer, "si", self.n_si_max).detach()
-        o_u = self._raw_parameters(o_logits, o_transformer, "o", self.n_o_max)
-        losses, teacher_scales = [], []
-        for local, rid in enumerate(row_ids.detach().cpu().tolist()):
-            row = self.rows[int(rid)]
-            if row is None:
-                continue
-            spg, si_wps, o_wps, target = row
-            si_pos, o_pos = [], []
-            for slot, wp_index in enumerate(si_wps):
-                M, q = self._site_template(spg, wp_index)
-                M = torch.as_tensor(M, device=device, dtype=o_logits.dtype)
-                q = torch.as_tensor(q, device=device, dtype=o_logits.dtype)
-                si_pos.append(torch.einsum("aij,j->ai", M, si_u[local,slot]) + q)
-            for slot, wp_index in enumerate(o_wps):
-                M, q = self._site_template(spg, wp_index)
-                M = torch.as_tensor(M, device=device, dtype=o_logits.dtype)
-                q = torch.as_tensor(q, device=device, dtype=o_logits.dtype)
-                o_pos.append(torch.einsum("aij,j->ai", M, o_u[local,slot]) + q)
-            if not si_pos or not o_pos:
-                continue
-            predicted = self._ordered_torch(torch.cat(si_pos).detach(), torch.cat(o_pos), cells[local])
-            if predicted is None:
-                continue
-            terms = []
-            for name, weight in self.METRIC_WEIGHTS.items():
-                target_tensor = torch.as_tensor(target[name], device=device, dtype=o_logits.dtype)
-                if predicted[name].numel() != target_tensor.numel():
-                    continue
-                scale = target_tensor.std(unbiased=False).clamp_min(0.10)
-                terms.append(weight * torch.nn.functional.smooth_l1_loss(
-                    predicted[name] / scale, target_tensor / scale, reduction="mean"
-                ))
-            if terms:
-                losses.append(sum(terms) / sum(self.METRIC_WEIGHTS.values()))
-                teacher_scales.append(o_logits.new_zeros(()))
-        if not losses:
-            zero = o_logits.sum() * 0.0
-            return zero, zero
-        return torch.stack(losses).mean(), torch.stack(teacher_scales).mean()
+    def _initial_raw(self, template, target, nstart):
+        base=float(target.target_ti_nn_mean)*max(template['n_ti'],1)**(1/3)
+        nlat=len(template['spec']); ncoord=sum(template['site_dofs'])
+        raw=torch.randn((nstart,nlat+ncoord),device=self.device,dtype=torch.float32)
+        # lattice logits centered around a chemistry-derived scale
+        raw[:,:nlat] *= 0.35
+        raw[:,:nlat] += math.log(math.expm1(max(base - 1.2, 0.5)))
+        return raw
 
-
-def _cell_matrix_numpy(row):
-    a, b, c = float(row["a"]), float(row["b"]), float(row["c"])
-    alpha, beta, gamma = (
-        float(row["alpha"]), float(row["beta"]), float(row["gamma"])
-    )
-    ca, cb, cg = np.cos(alpha), np.cos(beta), np.cos(gamma)
-    sg = np.sin(gamma)
-    if abs(sg) < 1.0e-10:
-        raise ValueError("Degenerate gamma angle.")
-    y3 = c * (ca - cb * cg) / sg
-    z3_sq = c * c - (c * cb) ** 2 - y3 ** 2
-    if z3_sq <= 1.0e-10:
-        raise ValueError("Degenerate cell metric.")
-    return np.asarray(
-        [
-            [a, 0.0, 0.0],
-            [b * cg, b * sg, 0.0],
-            [c * cb, y3, np.sqrt(z3_sq)],
-        ],
-        dtype=np.float32,
-    )
-
-
-def _periodic_nearest_numpy(frac, cell, shift_range=2):
-    shifts = np.asarray(
-        [
-            [i, j, k]
-            for i in range(-shift_range, shift_range + 1)
-            for j in range(-shift_range, shift_range + 1)
-            for k in range(-shift_range, shift_range + 1)
-        ],
-        dtype=float,
-    )
-    delta = frac[:, None, None, :] - frac[None, :, None, :]
-    delta = delta + shifts[None, None, :, :]
-    cart = np.einsum("...i,ij->...j", delta, cell)
-    distances = np.linalg.norm(cart, axis=-1)
-    zero_shift = np.where(np.all(shifts == 0, axis=1))[0][0]
-    ids = np.arange(len(frac))
-    distances[ids, ids, zero_shift] = np.inf
-    return distances.reshape(len(frac), -1).min(axis=1)
-
-
-def _deduplicate_fractional_positions(frac, tol=1.0e-5):
-    """Merge periodically equivalent fractional coordinates.
-
-    PyXtal Wyckoff operation lists can contain multiple operations that map a
-    special-position generator onto the same physical atom.  These duplicates
-    must not be interpreted as zero-distance neighbours.
-    """
-    frac = np.asarray(frac, dtype=float).reshape(-1, 3) % 1.0
-    unique = []
-    for position in frac:
-        duplicate = False
-        for existing in unique:
-            delta = position - existing
-            delta -= np.round(delta)
-            if np.linalg.norm(delta) <= tol:
-                duplicate = True
-                break
-        if not duplicate:
-            unique.append(position)
-    if not unique:
-        return np.empty((0, 3), dtype=float)
-    return np.asarray(unique, dtype=float)
-
-
-def _expand_si_from_lego_row(row, num_wps, dedup_tol=1.0e-5):
-    """Return unique symmetry-expanded Si coordinates and the cell matrix."""
-    spg = int(round(float(row["spg"])))
-    group = Group(spg)
-    positions = []
-    expected_count = 0
-    for slot in range(num_wps):
-        if int(row[f"target_coord{slot}"]) != SI_CN:
-            continue
-        wp_index = int(row[f"wp{slot}"])
-        if wp_index < 0 or wp_index >= len(group):
-            continue
-        generator = np.asarray(
-            [row[f"x{slot}"], row[f"y{slot}"], row[f"z{slot}"]],
-            dtype=float,
-        )
-        wp = group[wp_index]
-        site_positions = np.asarray(
-            [op.operate(generator) for op in wp.ops], dtype=float
-        ) % 1.0
-        site_positions = _deduplicate_fractional_positions(
-            site_positions, tol=dedup_tol
-        )
-        # A correctly reconstructed generating coordinate should expand to the
-        # Wyckoff multiplicity.  Keep the unique positions even if finite input
-        # precision causes a mismatch, but reject a completely collapsed site.
-        if len(site_positions) == 0:
-            raise ValueError(
-                f"Si Wyckoff site {wp_index} in space group {spg} expanded to no atoms."
-            )
-        expected_count += int(wp.multiplicity)
-        positions.extend(site_positions.tolist())
-
-    positions = _deduplicate_fractional_positions(positions, tol=dedup_tol)
-    if len(positions) < 2:
-        raise ValueError("Need at least two unique expanded Si atoms.")
-    if expected_count > 0 and len(positions) > expected_count:
-        raise RuntimeError(
-            f"Expanded {len(positions)} unique Si atoms, exceeding expected "
-            f"Wyckoff multiplicity sum {expected_count}."
-        )
-    return positions, _cell_matrix_numpy(row)
-
-
-def _periodic_pair_distances_numpy(frac, cell, shift_range=1):
-    """Full minimum-image pair-distance matrix under periodic translations."""
-    shifts = np.asarray(
-        [
-            [i, j, k]
-            for i in range(-shift_range, shift_range + 1)
-            for j in range(-shift_range, shift_range + 1)
-            for k in range(-shift_range, shift_range + 1)
-        ],
-        dtype=float,
-    )
-    delta = frac[:, None, None, :] - frac[None, :, None, :]
-    delta = delta + shifts[None, None, :, :]
-    cart = np.einsum("...i,ij->...j", delta, cell)
-    dist = np.linalg.norm(cart, axis=-1).min(axis=2)
-    np.fill_diagonal(dist, np.inf)
-    # Numerical or symmetry-equivalent duplicates must never enter the local
-    # density or hard-contact statistics as physical neighbours.
-    dist[dist < 1.0e-5] = np.inf
-    return dist
-
-
-
-
-
-# Process-local caches: initialized independently in each CPU worker.
-_WORKER_GROUP_CACHE = {}
-_WORKER_OPS_CACHE = {}
-
-
-def _cached_group(spg):
-    spg = int(spg)
-    group = _WORKER_GROUP_CACHE.get(spg)
-    if group is None:
-        group = Group(spg)
-        _WORKER_GROUP_CACHE[spg] = group
-    return group
-
-
-def _cached_ops(spg, wp_index):
-    key = (int(spg), int(wp_index))
-    cached = _WORKER_OPS_CACHE.get(key)
-    if cached is not None:
-        return cached
-    wp = _cached_group(spg)[int(wp_index)]
-    rotations, translations = [], []
-    for op in wp.ops:
-        rot = getattr(op, "rotation_matrix", None)
-        trans = getattr(op, "translation_vector", None)
-        if rot is None or trans is None:
-            affine = np.asarray(op.affine_matrix, dtype=float)
-            rot, trans = affine[:3, :3], affine[:3, 3]
-        rotations.append(np.asarray(rot, dtype=np.float32))
-        translations.append(np.asarray(trans, dtype=np.float32))
-    cached = (np.asarray(rotations), np.asarray(translations))
-    _WORKER_OPS_CACHE[key] = cached
-    return cached
-
-
-def _expand_one_species_worker(payload):
-    """Expand only one requested species; CUDA is never touched here."""
-    position, row_dict, num_wps, target_cn = payload
-    try:
-        spg = int(round(float(row_dict["spg"])))
-        group = _cached_group(spg)
-        points = []
-        for slot in range(int(num_wps)):
-            if int(row_dict[f"target_coord{slot}"]) != int(target_cn):
-                continue
-            wp_index = int(row_dict[f"wp{slot}"])
-            if wp_index < 0 or wp_index >= len(group):
-                raise ValueError(f"Invalid Wyckoff index {wp_index} for spg {spg}.")
-            generator = np.asarray(
-                [row_dict[f"x{slot}"], row_dict[f"y{slot}"], row_dict[f"z{slot}"]],
-                dtype=np.float32,
-            )
-            rotations, translations = _cached_ops(spg, wp_index)
-            expanded = np.einsum("aij,j->ai", rotations, generator) + translations
-            expanded = _deduplicate_fractional_positions(expanded % 1.0)
-            if len(expanded) == 0:
-                raise ValueError(f"Collapsed Wyckoff site {wp_index} for spg {spg}.")
-            points.extend(expanded.tolist())
-        points = _deduplicate_fractional_positions(points)
-        minimum = 2 if int(target_cn) == SI_CN else 1
-        if len(points) < minimum:
-            raise ValueError(f"Insufficient expanded atoms for CN label {target_cn}: {len(points)}.")
-        return position, True, np.asarray(points, dtype=np.float32), ""
-    except Exception as exc:
-        return position, False, np.empty((0, 3), dtype=np.float32), f"{type(exc).__name__}: {exc}"
-
-
-def prepare_species_candidates(batch_df, num_wps, target_cn, workers=0, executor=None):
-    """CPU-expand one species while preserving input row order."""
-    records = batch_df.to_dict(orient="records")
-    payloads = [(i, row, int(num_wps), int(target_cn)) for i, row in enumerate(records)]
-    if int(workers) <= 1:
-        results = [_expand_one_species_worker(item) for item in payloads]
-    else:
-        owns_executor = executor is None
-        pool = executor or ProcessPoolExecutor(max_workers=int(workers))
-        try:
-            chunksize = max(1, len(payloads) // max(1, int(workers) * 4))
-            results = list(pool.map(_expand_one_species_worker, payloads, chunksize=chunksize))
-        finally:
-            if owns_executor:
-                pool.shutdown(wait=True)
-    output = [None] * len(records)
-    for position, ok, coords, error in results:
-        output[int(position)] = {"ok": bool(ok), "coords": coords, "error": error}
-    return output
-
-
-def combine_prepared_species(batch_df, si_prepared, o_prepared=None):
-    """Attach validated cell matrices and combine prepared species arrays.
-
-    Geometry failures are represented per candidate and must never abort an
-    otherwise valid sampling round.  In particular, decoded cell parameters
-    can occasionally produce a singular metric even when Wyckoff expansion
-    itself succeeds.
-    """
-    if len(batch_df) != len(si_prepared) or (
-        o_prepared is not None and len(batch_df) != len(o_prepared)
-    ):
-        raise ValueError("Prepared geometry count does not match batch rows.")
-
-    empty_xyz = np.empty((0, 3), dtype=np.float32)
-    empty_cell = np.empty((3, 3), dtype=np.float32)
-    combined = []
-    for position, (_, row) in enumerate(batch_df.iterrows()):
-        si_item = si_prepared[position]
-        o_item = None if o_prepared is None else o_prepared[position]
-
-        species_ok = bool(si_item.get("ok", False)) and (
-            o_item is None or bool(o_item.get("ok", False))
-        )
-        error = ""
-        if not bool(si_item.get("ok", False)):
-            error = si_item.get("error", "Si expansion failed")
-        elif o_item is not None and not bool(o_item.get("ok", False)):
-            error = o_item.get("error", "O expansion failed")
-
-        cell = empty_cell
-        cell_ok = False
-        if species_ok:
-            try:
-                cell = np.asarray(_cell_matrix_numpy(row), dtype=np.float32)
-                if cell.shape != (3, 3) or not np.all(np.isfinite(cell)):
-                    raise ValueError("Non-finite or malformed cell matrix.")
-                det = float(np.linalg.det(cell))
-                if not np.isfinite(det) or abs(det) <= 1.0e-8:
-                    raise ValueError(f"Singular cell matrix with determinant {det}.")
-                cell_ok = True
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-
-        ok = bool(species_ok and cell_ok)
-        combined.append({
-            "ok": ok,
-            "si": (
-                np.asarray(si_item["coords"], dtype=np.float32)
-                if bool(si_item.get("ok", False)) else empty_xyz
-            ),
-            "o": (
-                empty_xyz if o_item is None
-                else np.asarray(o_item["coords"], dtype=np.float32)
-                if bool(o_item.get("ok", False)) else empty_xyz
-            ),
-            "cell": cell if ok else empty_cell,
-            "error": error,
-        })
-    return combined
-
-
-class OnlineOxygenFirstShellSelector:
-    """Online empirical population matching for the TiO6/OTi3 first shell.
-
-    Six marginal order-statistic populations are matched simultaneously:
-    Si->O d1/d4/d5 and O->Si d1/d2/d3.  All are extracted from one exact
-    27-image batched Ti-O distance matrix.  No angular or second-shell target
-    is used; d5 and d3 only mark the first unwanted neighbour.
-    """
-
-    METRICS = ("si_d1", "si_d4", "si_d5", "o_d1", "o_d2", "o_d3")
-
-    def __init__(self, training_prepared, requested_structures, bins=40,
-                 overfill_penalty=2.0, selection_temperature=0.003,
-                 weights=None, seed=42, device="cuda", gpu_batch=1024,
-                 memory_gib=1.5, cn_cutoff=2.2):
-        self.bins = int(bins)
-        self.overfill_penalty = float(overfill_penalty)
-        self.selection_temperature = float(selection_temperature)
-        self.weights = dict(weights or {
-            "si_d1": 0.5, "si_d4": 1.0, "si_d5": 1.0,
-            "o_d1": 0.5, "o_d2": 1.0, "o_d3": 1.0,
-        })
-        self.rng = np.random.default_rng(seed)
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.gpu_batch = max(1, int(gpu_batch))
-        self.max_bytes = int(float(memory_gib) * (1024 ** 3))
-        self.cn_cutoff = float(cn_cutoff)
-        self.failed_geometry = 0
-        self.raw_structures = 0
-        self.accepted_structures = 0
-        self.cn_si4 = []
-        self.cn_o2 = []
-        self.cn_both = []
-        training_desc = self.describe(training_prepared, update_raw=False)
-        if not training_desc:
-            raise RuntimeError("No valid training Ti-O first-shell environments.")
-        values = {name: [] for name in self.METRICS}
-        nsi, no = [], []
-        for item in training_desc:
-            for name in self.METRICS:
-                values[name].extend(item["values"][name].tolist())
-            nsi.append(len(item["values"]["si_d1"]))
-            no.append(len(item["values"]["o_d1"]))
-        self.edges, self.target_probability, self.target_counts = {}, {}, {}
-        self.training_values = {}
-        for name in self.METRICS:
-            arr = np.asarray(values[name], dtype=float)
-            self.training_values[name] = arr
-            q001, q999 = np.percentile(arr, [0.1, 99.9])
-            pad = max(0.05, 0.1 * (q999 - q001))
-            low = min(float(arr.min()), q001 - pad)
-            high = max(float(arr.max()), q999 + pad)
-            if high <= low:
-                high = low + 1.0
-            edges = np.linspace(low, high, self.bins + 1)
-            hist, _ = np.histogram(np.clip(arr, edges[0] + 1e-12, edges[-1] - 1e-12), bins=edges)
-            prob = hist.astype(float) / max(hist.sum(), 1)
-            mean_env = float(np.mean(nsi if name.startswith("si_") else no))
-            self.edges[name] = edges
-            self.target_probability[name] = prob
-            self.target_counts[name] = prob * requested_structures * mean_env
-        self.accepted_counts = {name: np.zeros(self.bins, dtype=float) for name in self.METRICS}
-        self.raw_counts = {name: np.zeros(self.bins, dtype=float) for name in self.METRICS}
-        self.accepted_values = {name: [] for name in self.METRICS}
-        self.raw_values = {name: [] for name in self.METRICS}
-
-    @staticmethod
-    def _shifts(device):
-        return torch.as_tensor([[i,j,k] for i in (-1,0,1) for j in (-1,0,1) for k in (-1,0,1)], device=device, dtype=torch.float32)
-
-    def _hist(self, name, arr):
-        edges = self.edges[name]
-        clipped = np.clip(np.asarray(arr, dtype=float), edges[0] + 1e-12, edges[-1] - 1e-12)
-        return np.histogram(clipped, bins=edges)[0].astype(float)
-
-    def describe(self, prepared, update_raw=True):
-        valid = [
-            i for i, item in enumerate(prepared)
-            if item.get("ok", False)
-            and len(item["si"]) >= 1
-            and len(item["o"]) >= 1
-        ]
-        self.failed_geometry += len(prepared) - len(valid) if update_raw else 0
-        descriptions = []
-        buckets = {}
-        for idx in valid:
-            item = prepared[idx]
-            buckets.setdefault((len(item["si"]), len(item["o"])), []).append(idx)
-        shifts = self._shifts(self.device)
-        with torch.inference_mode():
-            for (nsi, no), ids_all in buckets.items():
-                bytes_per = max(nsi * no * 27 * 3 * 4 * 3, 1)
-                dynamic = max(1, min(self.gpu_batch, self.max_bytes // bytes_per))
-                for start in range(0, len(ids_all), dynamic):
-                    ids = ids_all[start:start + dynamic]
-                    sf = torch.stack([torch.as_tensor(prepared[i]["si"], device=self.device) for i in ids]).float()
-                    of = torch.stack([torch.as_tensor(prepared[i]["o"], device=self.device) for i in ids]).float()
-                    cell = torch.stack([torch.as_tensor(prepared[i]["cell"], device=self.device) for i in ids]).float()
-                    delta = (
-                        sf[:, :, None, None, :]
-                        - of[:, None, :, None, :]
-                        + shifts[None, None, None, :, :]
-                    )
-                    cart = torch.einsum("bijsq,bqr->bijsr", delta, cell)
-                    sio_images = torch.linalg.norm(cart, dim=-1)
-                    # Preserve the 27 image axis while ranking/counting.  A
-                    # primitive-cell atom may contribute several distinct
-                    # periodic neighbours to the first shell.
-                    si_all = sio_images.reshape(len(ids), nsi, no * 27)
-                    o_all = (
-                        sio_images.permute(0, 2, 1, 3)
-                        .reshape(len(ids), no, nsi * 27)
-                    )
-                    si5 = torch.topk(
-                        si_all, k=5, dim=2, largest=False, sorted=True
-                    ).values
-                    o3 = torch.topk(
-                        o_all, k=3, dim=2, largest=False, sorted=True
-                    ).values
-                    si_cn = (si_all <= self.cn_cutoff).sum(dim=2)
-                    o_cn = (o_all <= self.cn_cutoff).sum(dim=2)
-                    for j, original in enumerate(ids):
-                        vals = {
-                            "si_d1": si5[j,:,0].cpu().numpy(),
-                            "si_d4": si5[j,:,3].cpu().numpy(),
-                            "si_d5": si5[j,:,4].cpu().numpy(),
-                            "o_d1": o3[j,:,0].cpu().numpy(),
-                            "o_d2": o3[j,:,1].cpu().numpy(),
-                            "o_d3": o3[j,:,2].cpu().numpy(),
-                        }
-                        hists = (
-                            {name: self._hist(name, vals[name]) for name in self.METRICS}
-                            if hasattr(self, "edges") and self.edges else {}
-                        )
-                        desc = {"position": int(original), "values": vals, "hist": hists,
-                                "frac_si4": float((si_cn[j] == 4).float().mean().item()),
-                                "frac_o2": float((o_cn[j] == 2).float().mean().item()),
-                                "all_both": bool((si_cn[j] == 4).all().item() and (o_cn[j] == 2).all().item())}
-                        descriptions.append(desc)
-                        if update_raw:
-                            for name in self.METRICS:
-                                self.raw_counts[name] += hists[name]
-                                self.raw_values[name].extend(vals[name].tolist())
-                            self.raw_structures += 1
-                    del sf, of, cell, delta, cart, sio_images, si_all, o_all
-                    del si5, o3, si_cn, o_cn
-        descriptions.sort(key=lambda x: x["position"])
-        return descriptions
-
-    def _score(self, desc, current):
-        score = 0.0
-        for name in self.METRICS:
-            hist = desc["hist"][name]
-            target = self.target_counts[name]
-            denom = np.maximum(target, 1.0)
-            deficit = np.maximum(target - current[name], 0.0)
-            fill = np.sum(hist * deficit / denom)
-            over = np.sum(np.maximum(current[name] + hist - target, 0.0) / denom)
-            score += self.weights[name] * (fill - self.overfill_penalty * over)
-        if self.selection_temperature > 0:
-            score += float(self.rng.gumbel(0.0, self.selection_temperature))
-        return score
-
-    def candidate_mean_tv(self, desc):
-        values = []
-        for name in self.METRICS:
-            hist = np.asarray(desc["hist"][name], dtype=float)
-            values.append(self._tv(hist, self.target_probability[name]))
-        return float(np.mean(values))
-
-    def candidate_metric_tvs(self, desc):
-        return {
-            name: self._tv(np.asarray(desc["hist"][name], dtype=float),
-                          self.target_probability[name])
-            for name in self.METRICS
-        }
-
-    def candidate_max_tv(self, desc):
-        return float(max(self.candidate_metric_tvs(desc).values()))
-
-    def feedback_vector(self, desc):
-        """Compact local failure signal for error-conditioned O regeneration."""
-        features = []
-        for name in self.METRICS:
-            train = self.training_values[name]
-            scale = max(float(np.std(train)), 0.10)
-            value = float(np.mean(desc["values"][name]))
-            features.append((value - float(np.mean(train))) / scale)
-        si_gap = float(np.mean(desc["values"]["si_d5"] - desc["values"]["si_d4"]))
-        o_gap = float(np.mean(desc["values"]["o_d3"] - desc["values"]["o_d2"]))
-        train_si_gap = float(np.mean(self.training_values["si_d5"]) -
-                             np.mean(self.training_values["si_d4"]))
-        train_o_gap = float(np.mean(self.training_values["o_d3"]) -
-                            np.mean(self.training_values["o_d2"]))
-        features.extend([
-            (si_gap - train_si_gap) / max(float(np.std(self.training_values["si_d5"])), 0.10),
-            (o_gap - train_o_gap) / max(float(np.std(self.training_values["o_d3"])), 0.10),
-        ])
-        return np.asarray(features, dtype=np.float32)
-
-    def select(self, descriptions, remaining, oversample_factor=1.0, commit=True,
-               block_size=64, min_score=0.0, max_selected=None):
-        """Ranked block-greedy six-population selection.
-
-        Scores are relative ranking criteria, not pass/fail thresholds.  The
-        previous positive-score gate collapsed to a one-candidate fallback once
-        early target bins were filled.  This routine always returns the best
-        requested number of candidates, rescoring after each committed block.
-        ``min_score`` is accepted but does not alter the ranking score.
-        """
-        if not descriptions or remaining <= 0:
-            return np.zeros(0, dtype=int)
-        available = np.arange(len(descriptions))
-        current = {name: self.accepted_counts[name].copy() for name in self.METRICS}
-        selected = []
-        limit = min(int(remaining), len(descriptions), int(max_selected or len(descriptions)))
-        while available.size and len(selected) < limit:
-            scores = np.asarray([self._score(descriptions[int(i)], current) for i in available])
-            order = np.argsort(scores)[::-1]
-            ntake = min(int(block_size), limit - len(selected), available.size)
-            take = order[:ntake]
-            chosen = available[take]
-            selected.extend(chosen.tolist())
-            for idx in chosen:
-                for name in self.METRICS:
-                    current[name] += descriptions[int(idx)]["hist"][name]
-            keep = np.ones(available.size, dtype=bool)
-            keep[take] = False
-            available = available[keep]
-        if commit:
-            self.commit(descriptions, selected)
-        return np.asarray(selected, dtype=int)
-
-    def commit(self, descriptions, selected):
-        for chosen in selected:
-            item = descriptions[int(chosen)]
-            for name in self.METRICS:
-                self.accepted_counts[name] += item["hist"][name]
-                self.accepted_values[name].extend(item["values"][name].tolist())
-            self.cn_si4.append(item["frac_si4"])
-            self.cn_o2.append(item["frac_o2"])
-            self.cn_both.append(item["all_both"])
-        self.accepted_structures += len(selected)
-
-    @staticmethod
-    def _tv(counts, target):
-        return float(0.5 * np.abs(counts / max(counts.sum(), 1.0) - target).sum())
-
-    def concise(self):
-        tv = np.mean([self._tv(self.accepted_counts[n], self.target_probability[n]) for n in self.METRICS])
-        return (f"accepted={self.accepted_structures}, mean_TV={tv:.4f}, "
-                f"Si_CN4={np.mean(self.cn_si4) if self.cn_si4 else np.nan:.3f}, "
-                f"O_CN2={np.mean(self.cn_o2) if self.cn_o2 else np.nan:.3f}, "
-                f"all_both={np.mean(self.cn_both) if self.cn_both else np.nan:.3f}")
-
-    def metric_summary(self, scope="accepted"):
-        if scope == "accepted":
-            source = self.accepted_values
-            count_source = self.accepted_counts
-        elif scope == "raw":
-            source = self.raw_values
-            count_source = self.raw_counts
-        elif scope == "training":
-            source = self.training_values
-            count_source = None
+    def _lattice_and_frac(self, template, raw):
+        B=raw.shape[0]; nlat=len(template['spec'])
+        vals=raw[:,:nlat]
+        lengths=torch.nn.functional.softplus(vals)+1.2
+        lt=template['lattice_type']
+        pi=torch.tensor(math.pi,device=self.device)
+        if lt=='cubic':
+            a=lengths[:,0]; abc=torch.stack([a,a,a],1); ang=torch.full((B,3),math.pi/2,device=self.device)
+        elif lt=='tetragonal':
+            a,c=lengths[:,0],lengths[:,1]; abc=torch.stack([a,a,c],1); ang=torch.full((B,3),math.pi/2,device=self.device)
+        elif lt in {'hexagonal','trigonal'}:
+            a,c=lengths[:,0],lengths[:,1]; abc=torch.stack([a,a,c],1)
+            ang=torch.tensor([math.pi/2,math.pi/2,2*math.pi/3],device=self.device).repeat(B,1)
+        elif lt=='orthorhombic':
+            abc=lengths[:,:3]; ang=torch.full((B,3),math.pi/2,device=self.device)
+        elif lt=='monoclinic':
+            abc=lengths[:,:3]; beta=math.pi/3 + torch.sigmoid(vals[:,3])*math.pi/3
+            ang=torch.stack([torch.full_like(beta,math.pi/2),beta,torch.full_like(beta,math.pi/2)],1)
         else:
-            raise ValueError("scope must be accepted, raw, or training")
-        out = {}
-        for name in self.METRICS:
-            arr = np.asarray(source[name], dtype=float)
-            if arr.size:
-                q05, q50, q95 = np.percentile(arr, [5, 50, 95])
-                out[name] = {
-                    "mean": float(arr.mean()), "std": float(arr.std()),
-                    "q05": float(q05), "q50": float(q50), "q95": float(q95),
-                    "tv": self._tv(
-                        count_source[name] if count_source is not None else np.histogram(
-                            np.clip(arr, self.edges[name][0] + 1e-12,
-                                    self.edges[name][-1] - 1e-12),
-                            bins=self.edges[name]
-                        )[0].astype(float),
-                        self.target_probability[name],
-                    ),
-                }
-            else:
-                out[name] = {k: float("nan") for k in ("mean","std","q05","q50","q95","tv")}
-        return out
+            abc=lengths[:,:3]; ang=math.pi/4 + torch.sigmoid(vals[:,3:6])*math.pi/2
+        a,b,c=abc[:,0],abc[:,1],abc[:,2]; alpha,beta,gamma=ang[:,0],ang[:,1],ang[:,2]
+        ca,cb,cg,sg=torch.cos(alpha),torch.cos(beta),torch.cos(gamma),torch.sin(gamma).clamp_min(1e-4)
+        y3=c*(ca-cb*cg)/sg; z2=(c*c-(c*cb)**2-y3*y3).clamp_min(1e-6)
+        zero=torch.zeros_like(a)
+        row1=torch.stack([a,zero,zero],1); row2=torch.stack([b*cg,b*sg,zero],1); row3=torch.stack([c*cb,y3,torch.sqrt(z2)],1)
+        cell=torch.stack([row1,row2,row3],1)
+        frac=[]; cursor=nlat; free=[]
+        for dof,A,b0,R,t in zip(template['site_dofs'],template['gen_A'],template['gen_b'],template['orbit_rot'],template['orbit_trans']):
+            u=torch.sigmoid(raw[:,cursor:cursor+dof]); cursor+=dof; free.append(u)
+            gen=(u@A.T+b0) % 1.0
+            orbit=(torch.einsum('oij,bj->boi',R,gen)+t[None,:,:]) % 1.0
+            frac.append(orbit)
+        frac=torch.cat(frac,dim=1)
+        return abc,ang,cell,frac,free
 
-    def format_metric_summary(self, scope="accepted", prefix=""):
-        summary = self.metric_summary(scope=scope)
-        parts = []
-        for name in self.METRICS:
-            x = summary[name]
-            parts.append(
-                f"{name}={x['mean']:.3f}+/-{x['std']:.3f} "
-                f"[{x['q05']:.3f},{x['q50']:.3f},{x['q95']:.3f}] "
-                f"TV={x['tv']:.3f}"
-            )
-        return prefix + "; ".join(parts)
+    def _geometry(self, template, target, raw, include_angle):
+        abc,ang,cell,frac,free=self._lattice_and_frac(template,raw)
+        B,N=frac.shape[:2]; shifts=self._shifts
+        delta=frac[:,:,None,None,:]-frac[:,None,:,None,:]+shifts[None,None,None,:,:]
+        vec=torch.einsum('bijnk,bkl->bijnl',delta,cell)
+        dist=torch.linalg.norm(vec,dim=-1).clamp_min(1e-6)
+        eye=torch.eye(N,device=self.device,dtype=torch.bool)[None,:,:,None]
+        zero=(torch.arange(27,device=self.device)==ZERO_SHIFT)[None,None,None,:]
+        dist=dist.masked_fill(eye & zero, 1e6)
+        flat_d=dist.reshape(B,N,-1); flat_v=vec.reshape(B,N,-1,3)
+        width=max(float(target.target_ti_nn_width),0.10)
+        w=torch.sigmoid((self.chemistry_cutoff-flat_d)/width)
+        cn=w.sum(-1)
+        denom=w.sum((1,2)).clamp_min(1e-6)
+        mean=(w*flat_d).sum((1,2))/denom
+        var=(w*(flat_d-mean[:,None,None])**2).sum((1,2))/denom
+        cn_mean=cn.mean(1)
+        cn_loss=((cn_mean-float(target.target_ti_cn))/2.0)**2
+        mean_loss=((mean-float(target.target_ti_nn_mean))/max(width,0.15))**2
+        width_loss=((torch.sqrt(var+1e-8)-float(target.target_ti_nn_width))/max(width,0.15))**2
+        min_d=flat_d.min(-1).values.min(-1).values
+        exclusion=1.8*float(target.target_ti_sphere_radius)
+        overlap=torch.relu(exclusion-min_d).pow(2)/max(exclusion**2,0.1)
+        volume=torch.abs(torch.linalg.det(cell))/N
+        vol_loss=torch.log((volume/float(target.target_volume_per_ti)).clamp_min(1e-4)).pow(2)
+        aspect=abc.max(-1).values/abc.min(-1).values.clamp_min(1e-4)
+        shape_loss=torch.relu(aspect-5.0).pow(2)/25.0
+        angle_loss=torch.zeros((B,),device=self.device)
+        if include_angle:
+            K=min(self.max_neighbors,flat_d.shape[-1])
+            topd,idx=torch.topk(flat_d,K,dim=-1,largest=False)
+            topv=torch.gather(flat_v,2,idx[...,None].expand(-1,-1,-1,3))
+            norm=torch.linalg.norm(topv,dim=-1).clamp_min(1e-6)
+            cos=torch.einsum('bnik,bnjk->bnij',topv,topv)/(norm[:,:,:,None]*norm[:,:,None,:])
+            pairw=torch.sigmoid((self.chemistry_cutoff-topd)/width)
+            pw=pairw[:,:,:,None]*pairw[:,:,None,:]
+            tri=torch.triu(torch.ones((K,K),device=self.device,dtype=torch.bool),diagonal=1)
+            cosv=cos[:,:,tri]; pvw=pw[:,:,tri]
+            centers=torch.cos(torch.tensor(0.5*(ANGLE_BINS[:-1]+ANGLE_BINS[1:])*math.pi/180,device=self.device))
+            sigma=0.16
+            hist=(pvw[...,None]*torch.exp(-0.5*((cosv[...,None]-centers)/sigma)**2)).sum((1,2))
+            hist=hist/hist.sum(-1,keepdim=True).clamp_min(1e-8)
+            target_hist=torch.tensor(target.angle_profile,dtype=torch.float32,device=self.device)
+            angle_loss=((hist-target_hist[None,:])**2).mean(-1)*len(target.angle_profile)
+        total=cn_loss+mean_loss+0.5*width_loss+4.0*overlap+0.15*vol_loss+0.1*shape_loss+(0.7*angle_loss if include_angle else 0.0)
+        detail={'cn_loss':cn_loss,'distance_loss':mean_loss+0.5*width_loss,'angle_loss':angle_loss,'overlap_loss':overlap,'cell_loss':0.15*vol_loss+0.1*shape_loss,
+                'minimum_ti_ti_distance':min_d,'volume_per_ti':volume,'aspect_ratio':aspect,'achieved_cn':cn_mean,'achieved_nn_mean':mean,'achieved_nn_width':torch.sqrt(var+1e-8)}
+        return total,detail,(abc,ang,cell,frac,free)
 
-    def diagnostics_frame(self):
-        rows = []
-        for name in self.METRICS:
-            raw = self.raw_counts[name] / max(self.raw_counts[name].sum(), 1.0)
-            accepted = self.accepted_counts[name] / max(self.accepted_counts[name].sum(), 1.0)
-            for i in range(self.bins):
-                rows.append({"metric": name, "bin_left": self.edges[name][i], "bin_right": self.edges[name][i+1],
-                             "training_probability": self.target_probability[name][i],
-                             "raw_probability": raw[i], "accepted_probability": accepted[i]})
-        return pd.DataFrame(rows)
+    def _optimize(self, template, target, raw, steps, include_angle):
+        raw=raw.detach().clone().requires_grad_(True)
+        opt=torch.optim.Adam([raw],lr=self.lr)
+        best_raw=raw.detach().clone(); best=torch.full((raw.shape[0],),float('inf'),device=self.device)
+        for _ in range(int(steps)):
+            opt.zero_grad(set_to_none=True)
+            total,detail,_=self._geometry(template,target,raw,include_angle)
+            # total is batch-aggregated; keep all starts moving while selecting by per-start diagnostics later
+            total.mean().backward(); torch.nn.utils.clip_grad_norm_([raw],10.0); opt.step()
+        return raw.detach()
 
-
-
-class OnlineOConditionalAdapter(torch.nn.Module):
-    """Persistent error-conditioned proposal adapter trained during sampling.
-
-    It predicts the mean of the oxygen-only noise distribution from the frozen
-    complete-Si context and the latest eight-dimensional shell-error vector.
-    Online updates imitate the best improving noise vectors observed so far;
-    the pretrained VAE remains frozen.
-    """
-
-    def __init__(self, context_dim, feedback_dim, noise_dim, hidden_dim=128,
-                 lr=3.0e-4, replay_size=2048, device="cuda", seed=42):
-        super().__init__()
-        self.context_dim = int(context_dim)
-        self.feedback_dim = int(feedback_dim)
-        self.noise_dim = int(noise_dim)
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(self.context_dim + self.feedback_dim, int(hidden_dim)),
-            torch.nn.SiLU(),
-            torch.nn.Linear(int(hidden_dim), int(hidden_dim)),
-            torch.nn.SiLU(),
-            torch.nn.Linear(int(hidden_dim), self.noise_dim),
-        ).to(self.device)
-        torch.nn.init.zeros_(self.net[-1].weight)
-        torch.nn.init.zeros_(self.net[-1].bias)
-        self.optimizer = torch.optim.AdamW(self.parameters(), lr=float(lr), weight_decay=1e-6)
-        self.replay = deque(maxlen=int(replay_size))
-        self.rng = np.random.default_rng(seed)
-        self.update_steps = 0
-        self.last_loss = float("nan")
-
-    def _inputs(self, contexts, feedback):
-        x = np.concatenate([
-            np.asarray(contexts, dtype=np.float32),
-            np.asarray(feedback, dtype=np.float32),
-        ], axis=1)
-        return torch.as_tensor(x, device=self.device)
-
-    def propose(self, contexts, feedback, proposals_per_parent, exploration=1.0):
-        contexts = np.asarray(contexts, dtype=np.float32)
-        feedback = np.asarray(feedback, dtype=np.float32)
+    def build(self, spg, padded_token, target, sample_id):
+        template=self._template(spg,padded_token,target)
+        if template is None: return None,[]
+        raw=self._initial_raw(template,target,self.initializations)
+        raw=self._optimize(template,target,raw,self.screen_steps,False)
+        # rank starts independently by evaluating one at a time; only a small retained set reaches angles
+        scores=[]
         with torch.no_grad():
-            mean = self.net(self._inputs(contexts, feedback)).cpu().numpy()
-        k = int(proposals_per_parent)
-        noise = np.repeat(mean, k, axis=0)
-        noise += self.rng.normal(
-            0.0, float(exploration), size=noise.shape
-        ).astype(np.float32)
-        return noise.astype(np.float32, copy=False), mean.astype(np.float32, copy=False)
-
-    def remember(self, context, feedback, target_noise, weight):
-        self.replay.append((
-            np.asarray(context, dtype=np.float32).copy(),
-            np.asarray(feedback, dtype=np.float32).copy(),
-            np.asarray(target_noise, dtype=np.float32).copy(),
-            float(max(weight, 1.0e-3)),
-        ))
-
-    def update(self, steps=1, batch_size=64):
-        if not self.replay:
-            return float("nan")
-        losses = []
-        self.train()
-        for _ in range(max(1, int(steps))):
-            n = min(int(batch_size), len(self.replay))
-            ids = self.rng.choice(len(self.replay), size=n, replace=False)
-            batch = [self.replay[int(i)] for i in ids]
-            c = np.stack([x[0] for x in batch])
-            f = np.stack([x[1] for x in batch])
-            y = torch.as_tensor(np.stack([x[2] for x in batch]), device=self.device)
-            w = torch.as_tensor(np.asarray([x[3] for x in batch], dtype=np.float32), device=self.device)
-            pred = self.net(self._inputs(c, f))
-            per = (pred - y).square().mean(dim=1)
-            loss = (per * w / w.mean().clamp_min(1e-6)).mean()
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.parameters(), 5.0)
-            self.optimizer.step()
-            losses.append(float(loss.detach().cpu()))
-            self.update_steps += 1
-        self.eval()
-        self.last_loss = float(np.mean(losses))
-        return self.last_loss
-
-
-class OnlinePerSiNearestNeighborSelector:
-    """Match the accepted population of per-Ti nearest-neighbour distances.
-
-    Every symmetry-expanded Si atom contributes exactly one periodic nearest-
-    neighbour distance.  The target is a Gaussian fitted to the complete
-    training population.  Candidate structures are selected online to fill
-    deficits in the accepted global histogram; a broad explicit lower floor
-    is used only to reject catastrophic contacts.
-    """
-
-    def __init__(
-        self,
-        training_df,
-        num_wps,
-        requested_structures,
-        nn_bins=40,
-        shift_range=1,
-        overfill_penalty=1.0,
-        selection_temperature=0.01,
-        safety_floor=1.67,
-        target_sigma_scale=1.0,
-        histogram_sigma_span=4.0,
-        seed=42,
-        gpu_device="cuda",
-        gpu_contact_batch=128,
-        gpu_shift_chunk=27,
-        gpu_max_memory_gib=0.75,
-    ):
-        if requested_structures <= 0 or nn_bins < 4:
-            raise ValueError("Requested structures must be positive and nn_bins >= 4.")
-        if safety_floor <= 0 or target_sigma_scale <= 0 or histogram_sigma_span <= 1:
-            raise ValueError("Invalid NN support or Gaussian-width settings.")
-        self.num_wps = int(num_wps)
-        self.nn_bins = int(nn_bins)
-        self.shift_range = max(1, int(shift_range))
-        self.overfill_penalty = float(overfill_penalty)
-        self.selection_temperature = float(selection_temperature)
-        self.safety_floor = float(safety_floor)
-        self.target_sigma_scale = float(target_sigma_scale)
-        self.histogram_sigma_span = float(histogram_sigma_span)
-        self.rng = np.random.default_rng(seed)
-        self.gpu_device = torch.device(gpu_device if torch.cuda.is_available() else "cpu")
-        self.gpu_contact_batch = max(1, int(gpu_contact_batch))
-        self.gpu_shift_chunk = max(1, int(gpu_shift_chunk))
-        self.gpu_max_bytes = int(float(gpu_max_memory_gib) * (1024 ** 3))
-
-        training_values = []
-        nsi = []
-        skipped = 0
-        for _, row in training_df.iterrows():
-            try:
-                frac, cell = _expand_si_from_lego_row(row, self.num_wps)
-                nearest = _periodic_nearest_numpy(frac, cell, shift_range=self.shift_range)
-                nearest = nearest[np.isfinite(nearest)]
-                if len(nearest) != len(frac):
-                    raise ValueError("Incomplete periodic nearest-neighbour vector.")
-                training_values.extend(nearest.tolist())
-                nsi.append(len(nearest))
-            except Exception:
-                skipped += 1
-        if not training_values:
-            raise RuntimeError("No valid per-Ti nearest-neighbour training environments.")
-
-        self.training_values = np.asarray(training_values, dtype=float)
-        self.training_structures = len(nsi)
-        self.skipped_training = int(skipped)
-        self.mean_training_nsi = float(np.mean(nsi))
-        self.target_mean = float(np.mean(self.training_values))
-        raw_std = float(np.std(self.training_values))
-        self.target_std = max(raw_std * self.target_sigma_scale, 1.0e-3)
-        self.training_quantiles = {
-            name: float(value) for name, value in zip(
-                ("q01", "q05", "q25", "q50", "q75", "q95", "q99"),
-                np.percentile(self.training_values, [1, 5, 25, 50, 75, 95, 99]),
+            for i in range(raw.shape[0]):
+                val,_,_=self._geometry(template,target,raw[i:i+1],False); scores.append(float(val[0]))
+        order=np.argsort(scores)[:min(self.refine_starts,len(scores))]
+        refined=self._optimize(template,target,raw[order],self.refine_steps,True)
+        attempts=[]
+        with torch.no_grad():
+            for rank in range(refined.shape[0]):
+                total,detail,geom=self._geometry(template,target,refined[rank:rank+1],True)
+                abc,ang,cell,frac,free=geom
+                lattice=torch.cat([abc[0],ang[0]]).cpu().numpy()
+                free_np=np.zeros((len(template['wps']),3),float)
+                for j,u in enumerate(free): free_np[j,:u.shape[1]]=u[0].cpu().numpy()
+                item={'sample_id':sample_id,'initialization_id':int(order[rank]),'screen_rank':rank,'screen_loss':float(scores[order[rank]]),'success':bool(torch.isfinite(total[0])),'total_loss':float(total[0])}
+                for k,v in detail.items(): item[k]=float(v.mean())
+                item.update({'lattice':lattice,'free':free_np,'frac':frac[0].cpu().numpy(),'generators':None,'cell':cell[0].cpu().numpy()})
+                attempts.append(item)
+        attempts.sort(key=lambda x:x['total_loss'])
+        if not attempts: return None,[]
+        for rank,item in enumerate(attempts):
+            item['cn_error']=abs(item['achieved_cn']-float(target.target_ti_cn))
+            item['numerical_success']=bool(item['success'])
+            item['chemistry_success']=bool(
+                item['success'] and item['cn_error'] <= self.cn_tolerance and
+                item['minimum_ti_ti_distance'] >= self.minimum_distance and
+                item['total_loss'] <= self.maximum_loss
             )
-        }
+            item['final_rank']=rank
+        valid=[item for item in attempts if item['chemistry_success']]
+        chosen=(valid[0] if valid else attempts[0])
+        chosen['retained_rank']=chosen['final_rank']; chosen['retained_count']=len(valid)
+        chosen['screened_initializations']=self.initializations; chosen['refined_initializations']=len(order)
+        return chosen,attempts
 
-        low = min(
-            float(np.min(self.training_values)),
-            self.target_mean - self.histogram_sigma_span * self.target_std,
+
+
+
+def sample_rule_based_skeletons(draw, rng, max_independent_sites, max_ti_atoms):
+    spgs=[]; tokens=[]; attempts=0
+    while len(spgs)<draw and attempts<draw*100:
+        attempts+=1; spg=int(rng.integers(1,231))
+        try: group=Group(spg)
+        except Exception: continue
+        allowed=[i for i in range(len(group)) if 1<=int(group[i].multiplicity)<=max_ti_atoms]
+        if not allowed: continue
+        nsite=int(rng.integers(1,min(max_independent_sites,3,len(allowed))+1))
+        picked=[]; total=0
+        for w in rng.permutation(allowed):
+            m=int(group[int(w)].multiplicity)
+            if total+m<=max_ti_atoms:
+                picked.append(int(w)); total+=m
+            if len(picked)>=nsite: break
+        if not picked or total<2: continue
+        padded=picked+[-1]*(max_independent_sites-len(picked))
+        spgs.append(spg); tokens.append(encode_wp_token(padded))
+    return spgs,tokens
+
+
+
+def draw_proposals(model, mode, draw, rng, temperature, composition, num_wps, max_ti_atoms):
+    """Draw a complete S,W proposal population with explicit source semantics."""
+    proposals = []
+    stats = {"invalid_space_group": 0, "no_compatible_si_skeleton": 0}
+    if mode not in {"interpolation", "exploration", "mixed"}:
+        raise ValueError(f"Unsupported --sw-mode: {mode}")
+
+    if mode == "interpolation":
+        n_interpolation, n_exploration = int(draw), 0
+    elif mode == "exploration":
+        n_interpolation, n_exploration = 0, int(draw)
+    else:
+        # Give the extra slot to exploration for odd populations.
+        n_interpolation = int(draw) // 2
+        n_exploration = int(draw) - n_interpolation
+
+    if n_interpolation:
+        state = model.sample_ti_skeletons(
+            n_interpolation, temperature=temperature, hard=True,
+            composition_ratio=composition, max_independent_sites=num_wps,
         )
-        high = max(
-            float(np.max(self.training_values)),
-            self.target_mean + self.histogram_sigma_span * self.target_std,
+        proposals.extend(
+            (int(state["spg"][p]), str(state["si_skeleton_token"][p]), "interpolation")
+            for p in np.flatnonzero(state["valid_mask"])
         )
-        low = min(low, self.safety_floor)
-        if high <= low:
-            high = low + 1.0
-        self.edges = np.linspace(low, high, self.nn_bins + 1)
-        centers = 0.5 * (self.edges[:-1] + self.edges[1:])
-        gaussian = np.exp(-0.5 * ((centers - self.target_mean) / self.target_std) ** 2)
-        gaussian[centers <= self.safety_floor] = 0.0
-        if gaussian.sum() <= 0:
-            raise RuntimeError("Gaussian NN target has zero probability in all bins.")
-        self.target_probability = gaussian / gaussian.sum()
-        train_hist, _ = np.histogram(self.training_values, bins=self.edges)
-        self.training_empirical_probability = train_hist / max(train_hist.sum(), 1)
-        expected_environments = requested_structures * self.mean_training_nsi
-        self.target_counts = self.target_probability * expected_environments
+        for key in stats:
+            stats[key] += int(state["stats"].get(key, 0))
 
-        self.raw_counts = np.zeros(self.nn_bins, dtype=float)
-        self.accepted_counts = np.zeros(self.nn_bins, dtype=float)
-        self.raw_values = []
-        self.accepted_values = []
-        self.raw_structures = 0
-        self.accepted_structures = 0
-        self.rejected_safety = 0
-        self.failed_geometry = 0
-
-    def _gpu_nearest_vectors(self, expanded):
-        """Return one periodic nearest-neighbour vector per candidate structure."""
-        if not expanded:
-            return []
-        output = [None] * len(expanded)
-        order = sorted(range(len(expanded)), key=lambda i: len(expanded[i][1]))
-        r = self.shift_range
-        shifts_all = np.asarray(
-            [[i, j, k] for i in range(-r, r + 1)
-             for j in range(-r, r + 1) for k in range(-r, r + 1)],
-            dtype=np.float32,
+    if n_exploration:
+        ss, ww = sample_rule_based_skeletons(
+            n_exploration, rng, num_wps, max_ti_atoms
         )
-        with torch.inference_mode():
-            for base in range(0, len(order), self.gpu_contact_batch):
-                ids = order[base:base + self.gpu_contact_batch]
-                nmax = max(len(expanded[i][1]) for i in ids)
-                bytes_per_row = max(nmax * nmax * self.gpu_shift_chunk * 3 * 4, 1)
-                dynamic = max(1, min(len(ids), self.gpu_max_bytes // bytes_per_row))
-                for sub0 in range(0, len(ids), dynamic):
-                    sub = ids[sub0:sub0 + dynamic]
-                    b = len(sub)
-                    frac = torch.zeros((b, nmax, 3), device=self.gpu_device, dtype=torch.float32)
-                    mask = torch.zeros((b, nmax), device=self.gpu_device, dtype=torch.bool)
-                    metric = torch.zeros((b, 3, 3), device=self.gpu_device, dtype=torch.float32)
-                    lengths = []
-                    for j, idx in enumerate(sub):
-                        f = torch.as_tensor(expanded[idx][1], device=self.gpu_device, dtype=torch.float32)
-                        c = torch.as_tensor(expanded[idx][2], device=self.gpu_device, dtype=torch.float32)
-                        lengths.append(len(f))
-                        frac[j, :len(f)] = f
-                        mask[j, :len(f)] = True
-                        metric[j] = c @ c.T
-                    run = torch.full((b, nmax, nmax), float("inf"), device=self.gpu_device)
-                    for sh0 in range(0, len(shifts_all), self.gpu_shift_chunk):
-                        shifts = torch.as_tensor(
-                            shifts_all[sh0:sh0 + self.gpu_shift_chunk],
-                            device=self.gpu_device,
-                        )
-                        delta = (
-                            frac[:, :, None, None, :]
-                            - frac[:, None, :, None, :]
-                            + shifts[None, None, None, :, :]
-                        )
-                        d2 = torch.einsum("bijsq,bqr,bijsr->bijs", delta, metric, delta)
-                        run = torch.minimum(run, d2.amin(dim=3))
-                        del delta, d2
-                    pairmask = mask[:, :, None] & mask[:, None, :]
-                    eye = torch.eye(nmax, device=self.gpu_device, dtype=torch.bool)[None]
-                    run.masked_fill_(~pairmask | eye, float("inf"))
-                    nearest = torch.sqrt(run.amin(dim=2).clamp_min(0)).cpu().numpy()
-                    for j, idx in enumerate(sub):
-                        output[idx] = nearest[j, :lengths[j]].astype(float, copy=True)
-                    del frac, mask, metric, run, nearest
-        return output
-
-    def _histogram(self, values):
-        values = np.asarray(values, dtype=float)
-        clipped = np.clip(values, self.edges[0] + 1.0e-12, self.edges[-1] - 1.0e-12)
-        hist, _ = np.histogram(clipped, bins=self.edges)
-        return hist.astype(float)
-
-    def describe_batch(self, batch_df, prepared=None):
-        expanded = []
-        if prepared is None:
-            for position, (_, row) in enumerate(batch_df.iterrows()):
-                try:
-                    frac, cell = _expand_si_from_lego_row(row, self.num_wps)
-                    expanded.append((position, frac, cell))
-                except Exception:
-                    self.failed_geometry += 1
-        else:
-            if len(prepared) != len(batch_df):
-                raise ValueError("Prepared geometry count does not match batch rows.")
-            for position, item in enumerate(prepared):
-                if not item.get("ok", False):
-                    self.failed_geometry += 1
-                    continue
-                expanded.append((position, item["si"], item["cell"]))
-        vectors = self._gpu_nearest_vectors(expanded)
-        keep_rows = []
-        descriptions = []
-        for item, nearest in zip(expanded, vectors):
-            position, frac, _ = item
-            if nearest is None or len(nearest) != len(frac) or not np.all(np.isfinite(nearest)):
-                self.failed_geometry += 1
-                continue
-            if float(np.min(nearest)) <= self.safety_floor:
-                self.rejected_safety += 1
-                continue
-            hist = self._histogram(nearest)
-            self.raw_counts += hist
-            self.raw_values.extend(nearest.tolist())
-            self.raw_structures += 1
-            keep_rows.append(position)
-            descriptions.append({"hist": hist, "nn": nearest})
-        return keep_rows, descriptions
-
-    def _candidate_scores(self, histograms, current_counts):
-        deficit = np.maximum(self.target_counts - current_counts, 0.0)
-        denominator = np.maximum(self.target_counts, 1.0)
-        fill = (histograms * (deficit / denominator)[None, :]).sum(axis=1)
-        over = np.maximum(current_counts[None, :] + histograms - self.target_counts[None, :], 0.0)
-        over = (over / denominator[None, :]).sum(axis=1)
-        score = fill - self.overfill_penalty * over
-        if self.selection_temperature > 0:
-            score += self.rng.gumbel(0.0, self.selection_temperature, size=score.shape)
-        return score
-
-    def select(self, descriptions, remaining, oversample_factor=1.0, commit=True,
-               block_size=64, min_score=0.0, max_selected=None):
-        """Ranked block-greedy selection for the single Si-NN population.
-
-        Always return the best requested pool.  Absolute score sign is not a
-        valid pass/fail condition after some histogram bins have filled.
-        ``min_score`` is accepted but does not alter the ranking score.
-        """
-        if not descriptions or remaining <= 0:
-            return np.zeros(0, dtype=int)
-        histograms = np.stack([item["hist"] for item in descriptions])
-        available = np.arange(len(descriptions))
-        current = self.accepted_counts.copy()
-        selected = []
-        limit = min(int(remaining), len(descriptions), int(max_selected or len(descriptions)))
-        while available.size and len(selected) < limit:
-            scores = self._candidate_scores(histograms[available], current)
-            order = np.argsort(scores)[::-1]
-            ntake = min(int(block_size), limit - len(selected), available.size)
-            take = order[:ntake]
-            chosen = available[take]
-            selected.extend(chosen.tolist())
-            current += histograms[chosen].sum(axis=0)
-            keep = np.ones(available.size, dtype=bool)
-            keep[take] = False
-            available = available[keep]
-        if commit:
-            self.commit(descriptions, selected)
-        return np.asarray(selected, dtype=int)
-
-    def commit(self, descriptions, selected):
-        for chosen in selected:
-            self.accepted_counts += descriptions[int(chosen)]["hist"]
-            self.accepted_values.extend(descriptions[int(chosen)]["nn"].tolist())
-        self.accepted_structures += len(selected)
-
-    @staticmethod
-    def _tv(counts, target):
-        counts = np.asarray(counts, dtype=float)
-        if counts.sum() <= 0:
-            return float("nan")
-        return float(0.5 * np.abs(counts / counts.sum() - target).sum())
-
-    def histogram_distance(self, counts=None):
-        values = self.accepted_counts if counts is None else np.asarray(counts, dtype=float)
-        return self._tv(values, self.target_probability)
-
-    @staticmethod
-    def summarize_values(values):
-        values = np.asarray(values, dtype=float)
-        if values.size == 0:
-            return {"mean": float("nan"), "std": float("nan"),
-                    "q05": float("nan"), "q50": float("nan"), "q95": float("nan")}
-        q05, q50, q95 = np.percentile(values, [5, 50, 95])
-        return {
-            "mean": float(np.mean(values)),
-            "std": float(np.std(values)),
-            "q05": float(q05),
-            "q50": float(q50),
-            "q95": float(q95),
-        }
-
-    def accepted_summary(self):
-        return self.summarize_values(self.accepted_values)
-
-    def diagnostics_frame(self):
-        raw = self.raw_counts / max(self.raw_counts.sum(), 1.0)
-        accepted = self.accepted_counts / max(self.accepted_counts.sum(), 1.0)
-        rows = []
-        for i in range(self.nn_bins):
-            rows.append({
-                "bin_left": self.edges[i],
-                "bin_right": self.edges[i + 1],
-                "gaussian_target_probability": self.target_probability[i],
-                "training_empirical_probability": self.training_empirical_probability[i],
-                "raw_generated_probability": raw[i],
-                "accepted_probability": accepted[i],
-            })
-        return pd.DataFrame(rows)
+        proposals.extend(zip(ss, ww, ["exploration"] * len(ss)))
+    if mode == "mixed" and len(proposals) > 1:
+        rng.shuffle(proposals)
+    return proposals, stats
 
 
+def resolve_ngpu(requested):
+    visible = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    if requested < 0:
+        raise ValueError("--ngpu cannot be negative.")
+    if requested == 0:
+        return visible
+    if requested > visible:
+        raise ValueError(
+            f"Requested --ngpu={requested}, but only {visible} CUDA device(s) are visible."
+        )
+    return int(requested)
 
-def _periodic_cross_distances_numpy(a_frac, b_frac, cell):
-    """Return all 27-image distances from central a atoms to b images."""
-    a_frac = np.asarray(a_frac, dtype=float).reshape(-1, 3)
-    b_frac = np.asarray(b_frac, dtype=float).reshape(-1, 3)
-    shifts = np.asarray(
-        [[i, j, k] for i in (-1, 0, 1)
-         for j in (-1, 0, 1) for k in (-1, 0, 1)],
-        dtype=float,
+
+def deterministic_seed(global_seed, target_id, cycle, proposal_slot, initialization=0):
+    payload = f"{global_seed}:{target_id}:{cycle}:{proposal_slot}:{initialization}".encode()
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little") % (2**31 - 1)
+
+
+def proposal_hash(spg, token):
+    return f"{int(spg)}:{str(token)}"
+
+
+def candidate_score(item, target):
+    invalid = 0 if item.get("minimum_ti_ti_distance", 0.0) >= 2.0 else 1
+    return (
+        invalid,
+        abs(float(item.get("achieved_cn", 1e9)) - float(target.target_ti_cn)),
+        float(item.get("distance_loss", 1e9)),
+        float(item.get("angle_loss", 1e9)),
+        float(item.get("total_loss", 1e9)),
     )
-    delta = a_frac[:, None, None, :] - b_frac[None, :, None, :] + shifts[None, None, :, :]
-    cart = np.einsum("...i,ij->...j", delta, np.asarray(cell, dtype=float))
-    return np.linalg.norm(cart, axis=-1)
 
 
-def _expand_o_orbit(spg, wp_index, free_parameters):
-    group = Group(int(spg))
-    wp = group[int(wp_index)]
-    dof = int(wp.get_dof())
-    free = np.asarray(free_parameters, dtype=float)[:dof] % 1.0
-    generator = np.asarray(wp.get_position_from_free_xyzs(free), dtype=float) % 1.0
-    orbit = np.asarray([op.operate(generator) for op in wp.ops], dtype=float) % 1.0
-    return _deduplicate_fractional_positions(orbit), generator
-
-
-class PooledIonicDistanceTarget:
-    """Two narrowed ionic-distance distributions used for O construction.
-
-    Ti--O pools Ti->O1..O6 and O->Ti1..Ti3 into one distribution.
-    O--O uses the nearest periodic O neighbour for each O atom.  Both are fit
-    by Gaussians whose widths are intentionally compressed relative to the
-    measured training widths, suppressing elongated and diffuse environments.
-    """
-
-    def __init__(self, training_prepared, sio_sigma_scale=0.50,
-                 oo_sigma_scale=0.50, bins=48, hard_sio_min=1.20,
-                 hard_oo_min=1.20):
-        self.bins = max(12, int(bins))
-        self.hard_sio_min = float(hard_sio_min)
-        self.hard_oo_min = float(hard_oo_min)
-        sio_all, oo_all = [], []
-        self.skipped_training = 0
-        for item in training_prepared:
-            if not item.get("ok", False):
-                self.skipped_training += 1
-                continue
-            try:
-                values = self.extract(item["si"], item["o"], item["cell"])
-            except Exception:
-                self.skipped_training += 1
-                continue
-            sio_all.extend(values["sio"].tolist())
-            oo_all.extend(values["oo"].tolist())
-        if not sio_all or not oo_all:
-            raise RuntimeError("No valid pooled ionic-distance training environments.")
-        self.training = {
-            "sio": np.asarray(sio_all, dtype=float),
-            "oo": np.asarray(oo_all, dtype=float),
-        }
-        scales = {"sio": float(sio_sigma_scale), "oo": float(oo_sigma_scale)}
-        self.mu, self.training_sigma, self.sigma = {}, {}, {}
-        self.edges, self.target_probability = {}, {}
-        for name in ("sio", "oo"):
-            arr = self.training[name]
-            self.mu[name] = float(np.mean(arr))
-            self.training_sigma[name] = max(float(np.std(arr)), 1.0e-3)
-            self.sigma[name] = max(self.training_sigma[name] * scales[name], 0.03)
-            low = min(float(np.min(arr)), self.mu[name] - 5.0 * self.sigma[name])
-            high = max(float(np.max(arr)), self.mu[name] + 5.0 * self.sigma[name])
-            self.edges[name] = np.linspace(low, high, self.bins + 1)
-            centers = 0.5 * (self.edges[name][:-1] + self.edges[name][1:])
-            prob = np.exp(-0.5 * ((centers - self.mu[name]) / self.sigma[name]) ** 2)
-            prob /= prob.sum()
-            self.target_probability[name] = prob
-        self.accepted_counts = {
-            name: np.zeros(self.bins, dtype=float) for name in ("sio", "oo")
-        }
-        self.accepted_values = {"sio": [], "oo": []}
-        self.raw_counts = {name: np.zeros(self.bins, dtype=float) for name in ("sio", "oo")}
-        self.raw_values = {"sio": [], "oo": []}
-        self.accepted_structures = 0
-        self.raw_structures = 0
-
-    @staticmethod
-    def _oo_nearest(o_frac, cell):
-        o_frac = np.asarray(o_frac, dtype=float).reshape(-1, 3)
-        shifts = np.asarray(
-            [[i, j, k] for i in (-1, 0, 1)
-             for j in (-1, 0, 1) for k in (-1, 0, 1)], dtype=float)
-        delta = o_frac[:, None, None, :] - o_frac[None, :, None, :] + shifts[None, None, :, :]
-        cart = np.einsum("...i,ij->...j", delta, np.asarray(cell, dtype=float))
-        dist = np.linalg.norm(cart, axis=-1)
-        zero = int(np.flatnonzero(np.all(shifts == 0, axis=1))[0])
-        ids = np.arange(len(o_frac))
-        dist[ids, ids, zero] = np.inf
-        nearest = np.min(dist.reshape(len(o_frac), -1), axis=1)
-        return nearest[np.isfinite(nearest)]
-
-    @classmethod
-    def extract(cls, si_frac, o_frac, cell):
-        si_frac = np.asarray(si_frac, dtype=float).reshape(-1, 3)
-        o_frac = np.asarray(o_frac, dtype=float).reshape(-1, 3)
-        if len(si_frac) == 0 or len(o_frac) == 0:
-            raise ValueError("Empty species in pooled ionic-distance extraction.")
-        dist = _periodic_cross_distances_numpy(si_frac, o_frac, cell)
-        si_all = np.sort(dist.reshape(len(si_frac), -1), axis=1)
-        o_all = np.sort(np.transpose(dist, (1, 0, 2)).reshape(len(o_frac), -1), axis=1)
-        sio_parts = [
-            si_all[:, :min(SI_CN, si_all.shape[1])].reshape(-1),
-            o_all[:, :min(O_CN, o_all.shape[1])].reshape(-1),
-        ]
-        sio = np.concatenate(sio_parts)
-        oo = cls._oo_nearest(o_frac, cell)
-        return {"sio": sio[np.isfinite(sio)], "oo": oo[np.isfinite(oo)]}
-
-    def _hist(self, name, values):
-        arr = np.asarray(values, dtype=float)
-        arr = np.clip(arr, self.edges[name][0] + 1e-12, self.edges[name][-1] - 1e-12)
-        return np.histogram(arr, bins=self.edges[name])[0].astype(float)
-
-    @staticmethod
-    def _tv(counts, target):
-        counts = np.asarray(counts, dtype=float)
-        if counts.sum() <= 0:
-            return float("nan")
-        return float(0.5 * np.abs(counts / counts.sum() - target).sum())
-
-    def describe(self, si_frac, o_frac, cell, update_raw=False):
-        values = self.extract(si_frac, o_frac, cell)
-        hists = {name: self._hist(name, values[name]) for name in ("sio", "oo")}
-        z2 = {
-            name: float(np.mean(((values[name] - self.mu[name]) / self.sigma[name]) ** 2))
-            for name in ("sio", "oo")
-        }
-        tv = {
-            name: self._tv(hists[name], self.target_probability[name])
-            for name in ("sio", "oo")
-        }
-        desc = {"values": values, "hist": hists, "z2": z2, "tv": tv,
-                "mean_z2": 0.5 * (z2["sio"] + z2["oo"]),
-                "mean_tv": 0.5 * (tv["sio"] + tv["oo"])}
-        if update_raw:
-            for name in ("sio", "oo"):
-                self.raw_counts[name] += hists[name]
-                self.raw_values[name].extend(values[name].tolist())
-            self.raw_structures += 1
-        return desc
-
-    def partial_score(self, si_frac, o_frac, cell, fraction):
-        desc = self.describe(si_frac, o_frac, cell, update_raw=False)
-        # Local probability field: average Gaussian negative log-likelihood.
-        loss = 0.5 * desc["z2"]["sio"] + 0.5 * desc["z2"]["oo"]
-        # Population-shape term prevents all candidates collapsing exactly at mu.
-        loss += 0.20 * (desc["tv"]["sio"] + desc["tv"]["oo"])
-        # Early partial states should not dominate merely because they contain
-        # fewer O atoms; fraction only supplies a weak completion preference.
-        loss += 0.05 * (1.0 - float(fraction))
-        return float(loss)
-
-    def commit(self, desc):
-        for name in ("sio", "oo"):
-            self.accepted_counts[name] += desc["hist"][name]
-            self.accepted_values[name].extend(desc["values"][name].tolist())
-        self.accepted_structures += 1
-
-    def summary(self, scope="accepted"):
-        source = self.accepted_values if scope == "accepted" else self.raw_values
-        counts = self.accepted_counts if scope == "accepted" else self.raw_counts
-        out = {}
-        for name in ("sio", "oo"):
-            arr = np.asarray(source[name], dtype=float)
-            if arr.size:
-                q = np.percentile(arr, [5, 50, 95])
-                out[name] = {
-                    "mean": float(arr.mean()), "std": float(arr.std()),
-                    "q05": float(q[0]), "q50": float(q[1]), "q95": float(q[2]),
-                    "tv": self._tv(counts[name], self.target_probability[name]),
-                }
-            else:
-                out[name] = {k: float("nan") for k in ("mean","std","q05","q50","q95","tv")}
-        return out
-
-
-
-
-class TiO2IntegrityEvaluator:
-    """Periodic TiO6/OTi3 integrity gate and topology-quality descriptor."""
-
-    def __init__(self, max_ti_o=2.6, max_o_ti=2.6, max_angle_rms=22.0,
-                 min_ti_pass_fraction=1.0, min_o_pass_fraction=1.0):
-        self.max_ti_o = float(max_ti_o)
-        self.max_o_ti = float(max_o_ti)
-        self.max_angle_rms = float(max_angle_rms)
-        self.min_ti_pass_fraction = float(min_ti_pass_fraction)
-        self.min_o_pass_fraction = float(min_o_pass_fraction)
-        self.checked = 0
-        self.valid = 0
-        self.records = []
-
-    @staticmethod
-    def _angle_rms(vectors):
-        vectors = np.asarray(vectors, dtype=float)
-        norms = np.linalg.norm(vectors, axis=1)
-        if len(vectors) != 6 or np.any(norms <= 1.0e-10):
-            return float("inf")
-        unit = vectors / norms[:, None]
-        angles = []
-        for i in range(6):
-            for j in range(i + 1, 6):
-                cosine = float(np.clip(np.dot(unit[i], unit[j]), -1.0, 1.0))
-                angles.append(np.degrees(np.arccos(cosine)))
-        observed = np.sort(np.asarray(angles, dtype=float))
-        ideal = np.sort(np.asarray([90.0] * 12 + [180.0] * 3, dtype=float))
-        return float(np.sqrt(np.mean((observed - ideal) ** 2)))
-
-    def evaluate(self, ti_frac, o_frac, cell):
-        ti = np.asarray(ti_frac, dtype=float).reshape(-1, 3)
-        oxygen = np.asarray(o_frac, dtype=float).reshape(-1, 3)
-        cell = np.asarray(cell, dtype=float).reshape(3, 3)
-        if len(ti) == 0 or len(oxygen) == 0:
-            raise ValueError("Empty Ti or O sublattice in integrity evaluation.")
-
-        shifts = np.asarray(
-            [[i, j, k] for i in (-1, 0, 1)
-             for j in (-1, 0, 1) for k in (-1, 0, 1)],
-            dtype=float,
-        )
-        delta = ti[:, None, None, :] - oxygen[None, :, None, :] + shifts[None, None, :, :]
-        vectors = np.einsum("...i,ij->...j", delta, cell)
-        distances = np.linalg.norm(vectors, axis=-1)
-
-        ti_flat_d = distances.reshape(len(ti), -1)
-        ti_flat_v = vectors.reshape(len(ti), -1, 3)
-        if ti_flat_d.shape[1] < 6:
-            raise ValueError("Fewer than six periodic O neighbours are available per Ti.")
-        ti_order = np.argsort(ti_flat_d, axis=1)[:, :6]
-        ti_sixth = np.take_along_axis(ti_flat_d, ti_order, axis=1)[:, 5]
-        angle_rms = np.asarray([
-            self._angle_rms(ti_flat_v[i, ti_order[i]]) for i in range(len(ti))
-        ], dtype=float)
-        ti_site_pass = (ti_sixth <= self.max_ti_o) & (angle_rms <= self.max_angle_rms)
-
-        o_flat_d = np.transpose(distances, (1, 0, 2)).reshape(len(oxygen), -1)
-        if o_flat_d.shape[1] < 3:
-            raise ValueError("Fewer than three periodic Ti neighbours are available per O.")
-        o_third = np.sort(o_flat_d, axis=1)[:, 2]
-        o_site_pass = o_third <= self.max_o_ti
-
-        ti_pass_fraction = float(np.mean(ti_site_pass))
-        o_pass_fraction = float(np.mean(o_site_pass))
-        valid = bool(
-            ti_pass_fraction >= self.min_ti_pass_fraction
-            and o_pass_fraction >= self.min_o_pass_fraction
-        )
-        reasons = []
-        if ti_pass_fraction < self.min_ti_pass_fraction:
-            reasons.append(
-                f"TiO6 pass fraction {ti_pass_fraction:.3f} < {self.min_ti_pass_fraction:.3f}"
-            )
-        if o_pass_fraction < self.min_o_pass_fraction:
-            reasons.append(
-                f"OTi3 pass fraction {o_pass_fraction:.3f} < {self.min_o_pass_fraction:.3f}"
-            )
-
-        topology_loss = (
-            0.50 * float(np.mean(angle_rms)) / max(self.max_angle_rms, 1.0e-12)
-            + 0.25 * float(np.mean(ti_sixth)) / max(self.max_ti_o, 1.0e-12)
-            + 0.25 * float(np.mean(o_third)) / max(self.max_o_ti, 1.0e-12)
-        )
-        result = {
-            "integrity_valid": valid,
-            "integrity_failure_reasons": "; ".join(reasons),
-            "ti_o6_pass_fraction": ti_pass_fraction,
-            "o_ti3_pass_fraction": o_pass_fraction,
-            "ti_o_6th_max_A": float(np.max(ti_sixth)),
-            "ti_o_6th_mean_A": float(np.mean(ti_sixth)),
-            "o_ti_3rd_max_A": float(np.max(o_third)),
-            "o_ti_3rd_mean_A": float(np.mean(o_third)),
-            "tio6_angle_rms_max_deg": float(np.max(angle_rms)),
-            "tio6_angle_rms_mean_deg": float(np.mean(angle_rms)),
-            "topology_loss": float(topology_loss),
-        }
-        self.checked += 1
-        self.valid += int(valid)
-        return result
-
-    def record(self, sample_round, parent_index, decision, descriptor):
-        self.records.append({
-            "sample_round": int(sample_round),
-            "parent_index": int(parent_index),
-            "pool_action": decision,
-            **descriptor,
-        })
-
-
-class FixedCapacityDistributionPool:
-    """Fixed-size ensemble with progress-adaptive distribution optimization.
-
-    Complete geometry-valid candidates fill the pool without a distribution
-    gate. Fill-phase workload remains fixed near completion rather than shrinking
-    with the number of empty pool slots.  After filling, exact leave-one-out replacement minimizes a
-    normalized three-component objective (Ti--Ti NN, Ti--O, and O--O).
-    Component weights follow the unresolved relative error, with round-wise
-    smoothing.  Percentage guards prevent a swap from damaging any component
-    excessively, while replacement tolerance and convergence scale with the
-    current normalized progress.
-    """
-
-    COMPONENTS = ("nn", "sio", "oo")
-
-    def __init__(
-        self,
-        capacity,
-        density_selector,
-        ionic_target,
-        weight_exponent=1.0,
-        weight_floor=0.10,
-        weight_smoothing=0.20,
-        guard_min_fraction=0.05,
-        guard_max_fraction=0.20,
-        guard_absolute_floor=0.002,
-        replacement_relative_tolerance=1.0e-3,
-        replacement_absolute_floor=1.0e-5,
-        convergence_window_sqrt_factor=50.0,
-        convergence_window_min=500,
-        convergence_window_max=5000,
-        convergence_relative_gain=1.0e-2,
-        convergence_max_swap_fraction=2.0e-3,
-        convergence_max_swaps_floor=2,
-        minimum_postfill_multiplier=2.0,
-        minimum_postfill_capacity_fraction=0.10,
-        maximum_postfill_candidates=20000,
-        topology_weight=0.30,
-    ):
-        self.capacity = int(capacity)
-        self.density_selector = density_selector
-        self.ionic_target = ionic_target
-        self.weight_exponent = float(weight_exponent)
-        self.weight_floor = float(weight_floor)
-        self.weight_smoothing = float(weight_smoothing)
-        self.guard_min_fraction = float(guard_min_fraction)
-        self.guard_max_fraction = float(guard_max_fraction)
-        self.guard_absolute_floor = float(guard_absolute_floor)
-        self.replacement_relative_tolerance = float(
-            replacement_relative_tolerance
-        )
-        self.replacement_absolute_floor = float(replacement_absolute_floor)
-        raw_window = int(np.ceil(
-            float(convergence_window_sqrt_factor) * np.sqrt(max(self.capacity, 1))
-        ))
-        self.convergence_window = int(np.clip(
-            raw_window,
-            max(1, int(convergence_window_min)),
-            max(int(convergence_window_min), int(convergence_window_max)),
-        ))
-        self.convergence_relative_gain = float(convergence_relative_gain)
-        self.convergence_max_swaps = max(
-            int(convergence_max_swaps_floor),
-            int(np.ceil(float(convergence_max_swap_fraction) * self.convergence_window)),
-        )
-        self.minimum_postfill_candidates = max(
-            self.convergence_window,
-            int(np.ceil(float(minimum_postfill_multiplier) * self.convergence_window)),
-            int(np.ceil(float(minimum_postfill_capacity_fraction) * self.capacity)),
-        )
-        self.maximum_postfill_candidates = max(
-            self.minimum_postfill_candidates,
-            int(maximum_postfill_candidates),
-        )
-        self.topology_weight = float(topology_weight)
-
-        self.entries = []
-        self.loss = float("inf")
-        self.monitor_loss = float("inf")
-        self.complete_candidates = 0
-        self.postfill_candidates = 0
-        self.fill_accepts = 0
-        self.swap_accepts = 0
-        self.rejections = 0
-        self.baseline_tvs = None
-        self.weights = {name: 1.0 / len(self.COMPONENTS) for name in self.COMPONENTS}
-        self.loss_history = []
-        self.monitor_history = deque(maxlen=self.convergence_window + 1)
-        self.swap_history = deque(maxlen=self.convergence_window + 1)
-
-    def __len__(self):
-        return len(self.entries)
-
-    @property
-    def full(self):
-        return len(self.entries) >= self.capacity
-
-    @property
-    def nonimproving_streak(self):
-        """Compatibility/logging value: candidates since the most recent swap."""
-        if not self.full or not self.swap_history:
-            return 0
-        swaps_now = self.swap_history[-1]
-        for offset, swaps in enumerate(reversed(self.swap_history)):
-            if swaps < swaps_now:
-                return offset - 1
-        return min(self.postfill_candidates, len(self.swap_history) - 1)
-
-    @property
-    def hard_stop_reached(self):
-        return self.full and self.postfill_candidates >= self.maximum_postfill_candidates
-
-    @property
-    def convergence_reason(self):
-        if self.hard_stop_reached:
-            return "hard_postfill_cap"
-        if self.converged:
-            return "rolling_good_enough"
-        return None
-
-    @property
-    def converged(self):
-        if not self.full:
-            return False
-        if self.postfill_candidates < self.minimum_postfill_candidates:
-            return False
-        if len(self.monitor_history) < self.convergence_window + 1:
-            return False
-        old = float(self.monitor_history[0])
-        new = float(self.monitor_history[-1])
-        relative_gain = max(0.0, (old - new) / max(abs(old), 1.0e-12))
-        swaps = int(self.swap_history[-1] - self.swap_history[0])
-        return (
-            relative_gain <= self.convergence_relative_gain
-            and swaps <= self.convergence_max_swaps
-        )
-
-    def _aggregate(self, entries):
-        nn = np.zeros_like(self.density_selector.accepted_counts, dtype=float)
-        ionic = {
-            name: np.zeros_like(self.ionic_target.accepted_counts[name], dtype=float)
-            for name in ("sio", "oo")
-        }
-        for entry in entries:
-            nn += np.asarray(entry["nn_desc"]["hist"], dtype=float)
-            for name in ("sio", "oo"):
-                ionic[name] += np.asarray(entry["ionic_desc"]["hist"][name], dtype=float)
-        topology_sum = sum(float(entry["integrity_desc"]["topology_loss"]) for entry in entries)
-        topology_mean = topology_sum / max(len(entries), 1)
-        return nn, ionic, topology_mean
-
-    def _component_tvs(self, nn_counts, ionic_counts):
-        return {
-            "nn": float(self.density_selector.histogram_distance(nn_counts)),
-            "sio": float(self.ionic_target._tv(
-                ionic_counts["sio"], self.ionic_target.target_probability["sio"]
-            )),
-            "oo": float(self.ionic_target._tv(
-                ionic_counts["oo"], self.ionic_target.target_probability["oo"]
-            )),
-        }
-
-    def _normalized(self, tvs):
-        if self.baseline_tvs is None:
-            return {name: float(tvs[name]) for name in self.COMPONENTS}
-        return {
-            name: float(tvs[name]) / max(float(self.baseline_tvs[name]), 1.0e-12)
-            for name in self.COMPONENTS
-        }
-
-    def _objective(self, tvs):
-        normalized = self._normalized(tvs)
-        if self.baseline_tvs is None:
-            loss = float(np.mean(list(normalized.values())))
-        else:
-            loss = float(sum(self.weights[name] * normalized[name]
-                             for name in self.COMPONENTS))
-        monitor = float(np.mean(list(normalized.values())))
-        return loss, monitor, normalized
-
-    def _metrics_from_counts(self, nn_counts, ionic_counts, topology_mean):
-        tvs = self._component_tvs(nn_counts, ionic_counts)
-        loss, monitor, normalized = self._objective(tvs)
-        topology_mean = float(topology_mean)
-        loss += self.topology_weight * topology_mean
-        monitor += self.topology_weight * topology_mean
-        return {
-            "loss": loss,
-            "monitor_loss": monitor,
-            "topology_loss": topology_mean,
-            "nn_tv": tvs["nn"],
-            "sio_tv": tvs["sio"],
-            "oo_tv": tvs["oo"],
-            "normalized": normalized,
-        }
-
-    def current_components(self):
-        if not self.entries:
-            return {
-                "loss": float("nan"), "monitor_loss": float("nan"),
-                "nn_tv": float("nan"), "sio_tv": float("nan"),
-                "oo_tv": float("nan"), "topology_loss": float("nan"),
-                "normalized": {},
-            }
-        nn, ionic, topology = self._aggregate(self.entries)
-        return self._metrics_from_counts(nn, ionic, topology)
-
-    def _initialize_postfill_reference(self):
-        nn, ionic, topology = self._aggregate(self.entries)
-        tvs = self._component_tvs(nn, ionic)
-        self.baseline_tvs = {
-            name: max(float(tvs[name]), 1.0e-12) for name in self.COMPONENTS
-        }
-        self.weights = {name: 1.0 / len(self.COMPONENTS) for name in self.COMPONENTS}
-        comp = self._metrics_from_counts(nn, ionic, topology)
-        self.loss = comp["loss"]
-        self.monitor_loss = comp["monitor_loss"]
-        self.monitor_history.clear()
-        self.swap_history.clear()
-        self.monitor_history.append(self.monitor_loss)
-        self.swap_history.append(self.swap_accepts)
-
-    def begin_round(self):
-        """Update adaptive weights once, using the current unresolved errors."""
-        if not self.full or self.baseline_tvs is None:
-            return
-        comp = self.current_components()
-        unresolved = comp["normalized"]
-        raw = {
-            name: max(float(unresolved[name]), self.weight_floor)
-            ** self.weight_exponent
-            for name in self.COMPONENTS
-        }
-        scale = max(sum(raw.values()), 1.0e-12)
-        target = {name: raw[name] / scale for name in self.COMPONENTS}
-        alpha = self.weight_smoothing
-        smoothed = {
-            name: (1.0 - alpha) * self.weights[name] + alpha * target[name]
-            for name in self.COMPONENTS
-        }
-        norm = max(sum(smoothed.values()), 1.0e-12)
-        self.weights = {name: smoothed[name] / norm for name in self.COMPONENTS}
-        refreshed = self.current_components()
-        self.loss = refreshed["loss"]
-        self.monitor_loss = refreshed["monitor_loss"]
-
-    def _guard_fraction(self, current_monitor):
-        # At the post-fill reference monitor=1, use the broad guard.  Tighten
-        # smoothly toward guard_min_fraction as the normalized error shrinks.
-        progress_scale = float(np.clip(current_monitor, 0.0, 1.0))
-        return self.guard_min_fraction + (
-            self.guard_max_fraction - self.guard_min_fraction
-        ) * progress_scale
-
-    def _passes_guards(self, current_tvs, trial_tvs, guard_fraction):
-        for name in self.COMPONENTS:
-            allowance = max(
-                self.guard_absolute_floor,
-                guard_fraction * max(float(current_tvs[name]), 0.0),
-            )
-            if float(trial_tvs[name]) > float(current_tvs[name]) + allowance:
-                return False
-        return True
-
-    def _required_improvement(self, current_loss):
-        return max(
-            self.replacement_absolute_floor,
-            self.replacement_relative_tolerance * max(abs(current_loss), 1.0e-12),
-        )
-
-    def _record_postfill_candidate(self):
-        self.postfill_candidates += 1
-        comp = self.current_components()
-        self.loss = comp["loss"]
-        self.monitor_loss = comp["monitor_loss"]
-        self.monitor_history.append(self.monitor_loss)
-        self.swap_history.append(self.swap_accepts)
-
-    def _sync_selectors(self):
-        nn, ionic, _topology = self._aggregate(self.entries)
-        self.density_selector.accepted_counts = nn.copy()
-        self.density_selector.accepted_values = []
-        self.density_selector.accepted_structures = len(self.entries)
-        for entry in self.entries:
-            self.density_selector.accepted_values.extend(
-                np.asarray(entry["nn_desc"]["nn"], dtype=float).tolist()
-            )
-
-        self.ionic_target.accepted_counts = {
-            name: ionic[name].copy() for name in ("sio", "oo")
-        }
-        self.ionic_target.accepted_values = {"sio": [], "oo": []}
-        self.ionic_target.accepted_structures = len(self.entries)
-        for entry in self.entries:
-            for name in ("sio", "oo"):
-                self.ionic_target.accepted_values[name].extend(
-                    np.asarray(entry["ionic_desc"]["values"][name], dtype=float).tolist()
-                )
-
-    def consider(self, row, nn_desc, ionic_desc, integrity_desc):
-        self.complete_candidates += 1
-        entry = {
-            "row": row.copy(), "nn_desc": nn_desc,
-            "ionic_desc": ionic_desc, "integrity_desc": integrity_desc,
-        }
-
-        if not self.full:
-            self.entries.append(entry)
-            self.fill_accepts += 1
-            self._sync_selectors()
-            if self.full:
-                self._initialize_postfill_reference()
-            else:
-                comp = self.current_components()
-                self.loss = comp["loss"]
-                self.monitor_loss = comp["monitor_loss"]
-            self.loss_history.append(self.loss)
-            return {"action": "fill", "removed": None, **self.current_components()}
-
-        current_nn, current_ionic, current_topology = self._aggregate(self.entries)
-        current = self._metrics_from_counts(current_nn, current_ionic, current_topology)
-        current_tvs = {
-            "nn": current["nn_tv"], "sio": current["sio_tv"], "oo": current["oo_tv"]
-        }
-        guard_fraction = self._guard_fraction(current["monitor_loss"])
-        required = self._required_improvement(current["loss"])
-        candidate_nn = np.asarray(nn_desc["hist"], dtype=float)
-        candidate_ionic = {
-            name: np.asarray(ionic_desc["hist"][name], dtype=float)
-            for name in ("sio", "oo")
-        }
-
-        best_index = None
-        best = None
-        for i, old in enumerate(self.entries):
-            trial_nn = current_nn + candidate_nn - np.asarray(
-                old["nn_desc"]["hist"], dtype=float
-            )
-            trial_ionic = {
-                name: current_ionic[name] + candidate_ionic[name]
-                - np.asarray(old["ionic_desc"]["hist"][name], dtype=float)
-                for name in ("sio", "oo")
-            }
-            trial_topology = (
-                current_topology * len(self.entries)
-                + float(integrity_desc["topology_loss"])
-                - float(old["integrity_desc"]["topology_loss"])
-            ) / max(len(self.entries), 1)
-            trial = self._metrics_from_counts(trial_nn, trial_ionic, trial_topology)
-            trial_tvs = {
-                "nn": trial["nn_tv"], "sio": trial["sio_tv"], "oo": trial["oo_tv"]
-            }
-            if not self._passes_guards(current_tvs, trial_tvs, guard_fraction):
-                continue
-            if best is None or trial["loss"] < best["loss"]:
-                best_index = i
-                best = trial
-
-        if best_index is not None and best["loss"] < current["loss"] - required:
-            self.entries[best_index] = entry
-            self.swap_accepts += 1
-            self._sync_selectors()
-            self.loss = best["loss"]
-            self.monitor_loss = best["monitor_loss"]
-            self.loss_history.append(self.loss)
-            self._record_postfill_candidate()
-            return {
-                "action": "swap", "removed": best_index,
-                "improvement": current["loss"] - best["loss"],
-                "required_improvement": required,
-                "guard_fraction": guard_fraction,
-                **best,
-            }
-
-        self.rejections += 1
-        self.loss = current["loss"]
-        self.monitor_loss = current["monitor_loss"]
-        self._record_postfill_candidate()
-        return {
-            "action": "reject", "removed": None,
-            "improvement": 0.0,
-            "required_improvement": required,
-            "guard_fraction": guard_fraction,
-            **current,
-        }
-
-    def adaptive_status(self):
-        comp = self.current_components()
-        if self.full:
-            guard = self._guard_fraction(comp["monitor_loss"])
-            required = self._required_improvement(comp["loss"])
-        else:
-            guard = float("nan")
-            required = float("nan")
-
-        window_ready = len(self.monitor_history) >= self.convergence_window + 1
-        if window_ready:
-            old_monitor = float(self.monitor_history[0])
-            new_monitor = float(self.monitor_history[-1])
-            window_relative_gain = (
-                old_monitor - new_monitor
-            ) / max(abs(old_monitor), 1.0e-12)
-            window_swaps = int(self.swap_history[-1] - self.swap_history[0])
-        else:
-            window_relative_gain = float("nan")
-            window_swaps = 0
-
-        return {
-            **comp,
-            "weights": dict(self.weights),
-            "guard_fraction": guard,
-            "required_improvement": required,
-            "window": self.convergence_window,
-            "window_ready": window_ready,
-            "window_relative_gain": window_relative_gain,
-            "window_swaps": window_swaps,
-            "minimum_postfill": self.minimum_postfill_candidates,
-            "maximum_postfill": self.maximum_postfill_candidates,
-            "hard_stop_reached": self.hard_stop_reached,
-            "convergence_reason": self.convergence_reason,
-        }
-
-    def rows(self):
-        if not self.entries:
-            return pd.DataFrame()
-        return pd.concat([entry["row"] for entry in self.entries], ignore_index=True)
-
-
-class SequentialOxygenConstructor:
-    """Construct oxygen sites from cached ionic-field orbit probes."""
-
-    def __init__(self, ionic_target, n_o_max, beam_width=6,
-                 candidates_per_site=32, max_skeletons=2, seed=42):
-        self.ionic_target = ionic_target
-        self.n_o_max = int(n_o_max)
-        self.beam_width = max(1, int(beam_width))
-        self.candidates_per_site = max(8, int(candidates_per_site))
-        self.max_skeletons = max(1, int(max_skeletons))
-        self.probe_pool_size = max(64, 3 * self.candidates_per_site)
-        self.explore_fraction = 0.15
-        self.temperature = 0.35
-        self.rng = np.random.default_rng(seed)
-        self.seed = int(seed)
-
-    def _orbit_is_allowed(self, orbit, si_frac, existing_o, cell):
-        sio = _periodic_cross_distances_numpy(orbit, si_frac, cell)
-        if float(np.min(sio)) <= self.ionic_target.hard_sio_min:
-            return False
-        if len(existing_o):
-            oo = _periodic_cross_distances_numpy(orbit, existing_o, cell)
-            if float(np.min(oo)) <= self.ionic_target.hard_oo_min:
-                return False
-        if len(orbit) > 0:
-            self_oo = _periodic_cross_distances_numpy(orbit, orbit, cell)
-            flat = self_oo.reshape(len(orbit), len(orbit), 27)
-            shifts = np.asarray([[i, j, k] for i in (-1, 0, 1)
-                                 for j in (-1, 0, 1) for k in (-1, 0, 1)])
-            zero = int(np.flatnonzero(np.all(shifts == 0, axis=1))[0])
-            ids = np.arange(len(orbit))
-            flat[ids, ids, zero] = np.inf
-            if float(np.min(flat)) <= self.ionic_target.hard_oo_min:
-                return False
-        return True
-
-    def _sobol_points(self, dof, count, scramble_seed):
-        if dof == 0:
-            return np.zeros((1, 0), dtype=float)
-        engine = torch.quasirandom.SobolEngine(
-            dimension=dof, scramble=True,
-            seed=int(scramble_seed) % (2**31 - 1),
-        )
-        return engine.draw(int(count)).cpu().numpy().astype(float, copy=False)
-
-    def _build_probe_pool(self, spg, wp_index, dof, si_frac, cell, cache_seed):
-        requested = 1 if dof == 0 else self.probe_pool_size
-        points = self._sobol_points(dof, requested, cache_seed)
-        pool = []
-        for free in points:
-            try:
-                orbit, _ = _expand_o_orbit(spg, wp_index, free)
-            except Exception:
-                continue
-            if len(orbit) == 0 or not self._orbit_is_allowed(
-                    orbit, si_frac, np.empty((0, 3), dtype=float), cell):
-                continue
-            prior = self.ionic_target.partial_score(
-                si_frac, orbit, cell, fraction=0.0
-            )
-            pool.append((np.asarray(free, dtype=float), orbit, float(prior)))
-        return pool, requested
-
-    def _conditional_proxy(self, pool_item, existing_o, cell):
-        _, orbit, prior = pool_item
-        if len(existing_o) == 0:
-            return prior
-        oo = _periodic_cross_distances_numpy(orbit, existing_o, cell)
-        nearest = np.min(oo.reshape(len(orbit), -1), axis=1)
-        if float(np.min(nearest)) <= self.ionic_target.hard_oo_min:
-            return float("inf")
-        z2 = np.mean(((nearest - self.ionic_target.mu["oo"]) /
-                      self.ionic_target.sigma["oo"]) ** 2)
-        return float(prior + 0.5 * z2)
-
-    def _select_cached_probes(self, pool, existing_o, cell):
-        proxies = np.asarray([
-            self._conditional_proxy(item, existing_o, cell) for item in pool
-        ], dtype=float)
-        valid_ids = np.flatnonzero(np.isfinite(proxies))
-        if len(valid_ids) == 0:
-            return []
-        n_total = min(self.candidates_per_site, len(valid_ids))
-        n_explore = min(max(1, int(round(n_total * self.explore_fraction))), n_total)
-        n_guided = n_total - n_explore
-        chosen = []
-        if n_guided:
-            scores = proxies[valid_ids]
-            shifted = scores - np.min(scores)
-            log_weights = -shifted / self.temperature
-
-            # Stable weighted sampling without replacement.  Using
-            # Generator.choice(..., replace=False, p=weights) can fail when
-            # softmax underflow leaves fewer positive entries than requested.
-            # Gumbel-top-k works directly with log weights and therefore does
-            # not require exponentiation or a positive-probability count.
-            uniforms = np.clip(
-                self.rng.random(len(valid_ids)),
-                np.finfo(float).tiny,
-                1.0 - np.finfo(float).eps,
-            )
-            gumbels = -np.log(-np.log(uniforms))
-            ranking = log_weights + gumbels
-            if np.all(np.isfinite(ranking)):
-                local_ids = np.argsort(ranking)[-n_guided:][::-1]
-            else:
-                # Defensive fallback for any unexpected numerical pathology.
-                local_ids = self.rng.choice(
-                    len(valid_ids), size=n_guided, replace=False
-                )
-            guided_ids = valid_ids[np.asarray(local_ids, dtype=int)]
-            chosen.extend((int(i), "guided") for i in guided_ids)
-        used = {idx for idx, _ in chosen}
-        remaining = np.asarray([i for i in valid_ids if int(i) not in used], dtype=int)
-        if n_explore and len(remaining):
-            take = min(n_explore, len(remaining))
-            explore_ids = self.rng.choice(remaining, size=take, replace=False)
-            chosen.extend((int(i), "explore") for i in explore_ids)
-        return [(pool[idx], source) for idx, source in chosen]
-
-    def construct(self, global_row, si_frac, cell, skeleton_tokens,
-                  progress_label="O search", verbose=True):
-        spg = int(round(float(global_row["spg"])))
-        group = Group(spg)
-        unique_tokens = []
-        for token in skeleton_tokens:
-            if token not in unique_tokens:
-                unique_tokens.append(token)
-            if len(unique_tokens) >= self.max_skeletons:
-                break
-        best_complete = None
-        stats = {"attempted_states": 0, "guided_attempted": 0,
-                 "explore_attempted": 0, "guided_valid": 0,
-                 "explore_valid": 0, "guided_retained": 0,
-                 "explore_retained": 0, "probe_total": 0,
-                 "probe_valid": 0}
-        probe_cache = {}
-        search_start = time.perf_counter()
-        if verbose:
-            print(
-                f"{progress_label}: start, skeletons={len(unique_tokens)}, "
-                f"beam={self.beam_width}, cached_candidates/site={self.candidates_per_site}",
-                flush=True,
-            )
-
-        for skeleton_id, token in enumerate(unique_tokens):
-            try:
-                wps = decode_wp_token(token, self.n_o_max, "O skeleton")
-            except Exception:
-                continue
-            occupied = [(slot, int(wp)) for slot, wp in enumerate(wps) if int(wp) >= 0]
-            if not occupied:
-                continue
-            occupied.sort(key=lambda item: int(group[item[1]].multiplicity), reverse=True)
-            total_atoms = sum(int(group[wp].multiplicity) for _, wp in occupied)
-            beam = [(0.0, [], np.empty((0, 3), dtype=float), "seed")]
-            if verbose:
-                print(
-                    f"{progress_label}: skeleton {skeleton_id + 1}/{len(unique_tokens)}, "
-                    f"independent_sites={len(occupied)}, expanded_O={total_atoms}",
-                    flush=True,
-                )
-
-            for site_order, (slot, wp_index) in enumerate(occupied):
-                site_start = time.perf_counter()
-                dof = int(group[wp_index].get_dof())
-                key = (wp_index, dof)
-                if key not in probe_cache:
-                    pool, requested = self._build_probe_pool(
-                        spg, wp_index, dof, si_frac, cell,
-                        self.seed + 1009 * skeleton_id + 97 * slot + 17 * site_order,
-                    )
-                    probe_cache[key] = pool
-                    stats["probe_total"] += requested
-                    stats["probe_valid"] += len(pool)
-                pool = probe_cache[key]
-                if not pool:
-                    beam = []
-                    if verbose:
-                        print(
-                            f"{progress_label}: site {site_order + 1}/{len(occupied)} "
-                            f"wp={wp_index} dof={dof}, no valid cached probes",
-                            flush=True,
-                        )
-                    break
-
-                next_states = []
-                for _, params_list, existing_o, _ in beam:
-                    for pool_item, source in self._select_cached_probes(
-                            pool, existing_o, cell):
-                        stats[f"{source}_attempted"] += 1
-                        free, orbit, _ = pool_item
-                        if not self._orbit_is_allowed(orbit, si_frac, existing_o, cell):
-                            continue
-                        stats[f"{source}_valid"] += 1
-                        new_o = orbit if len(existing_o) == 0 else np.concatenate(
-                            [existing_o, orbit], axis=0
-                        )
-                        fraction = min(1.0, len(new_o) / max(total_atoms, 1))
-                        score = self.ionic_target.partial_score(
-                            si_frac, new_o, cell, fraction
-                        )
-                        padded = np.zeros(3, dtype=float)
-                        padded[:dof] = np.asarray(free, dtype=float)[:dof] % 1.0
-                        next_states.append((
-                            score,
-                            params_list + [(slot, wp_index, padded)],
-                            new_o,
-                            source,
-                        ))
-                        stats["attempted_states"] += 1
-                if not next_states:
-                    beam = []
-                    if verbose:
-                        print(
-                            f"{progress_label}: site {site_order + 1}/{len(occupied)} "
-                            f"wp={wp_index}, beam exhausted after "
-                            f"{time.perf_counter() - site_start:.1f}s",
-                            flush=True,
-                        )
-                    break
-                next_states.sort(key=lambda item: item[0])
-                beam = next_states[:self.beam_width]
-                for state in beam:
-                    if state[3] in ("guided", "explore"):
-                        stats[f"{state[3]}_retained"] += 1
-                if verbose:
-                    print(
-                        f"{progress_label}: site {site_order + 1}/{len(occupied)} "
-                        f"wp={wp_index} dof={dof}, probes={len(pool)}, "
-                        f"expanded_states={len(next_states)}, beam={len(beam)}, "
-                        f"best={beam[0][0]:.4f}, "
-                        f"elapsed={time.perf_counter() - site_start:.1f}s",
-                        flush=True,
-                    )
-
-            if not beam:
-                continue
-            score, params_list, oxygen, _ = min(beam, key=lambda item: item[0])
-            if best_complete is None or score < best_complete[0]:
-                best_complete = (score, token, params_list, oxygen)
-
-        elapsed = time.perf_counter() - search_start
-        if best_complete is None:
-            if verbose:
-                print(f"{progress_label}: failed after {elapsed:.1f}s", flush=True)
-            return None
-        score, token, params_list, oxygen = best_complete
-        if verbose:
-            print(
-                f"{progress_label}: complete, score={score:.4f}, "
-                f"attempted_states={stats['attempted_states']}, elapsed={elapsed:.1f}s",
-                flush=True,
-            )
-        record = {"o_skeleton_token": token}
-        for slot in range(self.n_o_max):
-            for j in range(3):
-                record[f"o_u{j}_{slot}"] = -1.0
-        for slot, _, padded in params_list:
-            for j in range(3):
-                record[f"o_u{j}_{slot}"] = float(padded[j])
-        return {"score": float(score), "o_df": pd.DataFrame([record]),
-                "oxygen": np.asarray(oxygen, dtype=np.float32),
-                "attempted_states": int(stats["attempted_states"]),
-                "proposal_stats": stats}
-
-
-_O_WORKER_TARGET = None
-_O_WORKER_CONFIG = None
-
-
-def _init_o_worker(ionic_target, config):
-    global _O_WORKER_TARGET, _O_WORKER_CONFIG
-    _O_WORKER_TARGET = ionic_target
-    _O_WORKER_CONFIG = dict(config)
-    torch.set_num_threads(1)
-
-
-def _search_one_si_framework(task):
-    parent_index, global_row, si_frac, cell, tokens, task_seed = task
-    started = time.perf_counter()
+def build_output_row(result, spg, padded_token, num_wps, n_ti_max):
+    lattice = result["lattice"]; free = result["free"]
+    record = dict(zip(BASE_COLUMNS, [int(spg), *map(float, lattice)]))
+    wps = [w for w in decode_wp_token(padded_token) if w >= 0]
+    sites = []
+    for i, wp in enumerate(wps):
+        xyz = _wyckoff_position_from_parameters(spg, wp, free[i])
+        sites.append((wp, xyz, TI_ROLE))
+    sites += [(-1, np.full(3, -1.0), 0)] * (num_wps - len(sites))
+    for i, (wp, xyz, role) in enumerate(sites):
+        record[f"wp{i}"] = int(wp)
+        record[f"x{i}"], record[f"y{i}"], record[f"z{i}"] = map(float, xyz)
+        record[f"target_coord{i}"] = int(role)
+    return record
+
+
+def save_ti_cif(result, path):
+    atoms = Atoms("Ti" * len(result["frac"]), scaled_positions=result["frac"],
+                  cell=result["cell"], pbc=True)
+    write(path, atoms, format="cif")
+
+
+def parse_composition(value):
+    parts = tuple(int(x.strip()) for x in value.split(","))
+    if len(parts) != 2 or min(parts) <= 0:
+        raise ValueError("--composition must contain two positive integers.")
+    return parts
+
+
+
+TIO_CUTOFF = 3.0
+OO_BINS = np.linspace(0.0, 6.0, 13)
+
+
+def oxygen_framework_from_row(row, num_wps):
+    spg = int(row["spg"])
+    group = Group(spg)
+    frac = []
+    for i in range(num_wps):
+        if int(row[f"target_coord{i}"]) != O_ROLE:
+            continue
+        wp_index = int(row[f"wp{i}"])
+        generator = np.asarray([row[f"x{i}"], row[f"y{i}"], row[f"z{i}"]], dtype=float)
+        orbit = _deduplicate_fractional([op.operate(generator) for op in group[wp_index].ops])
+        frac.extend(orbit.tolist())
+    return _deduplicate_fractional(frac)
+
+
+def periodic_cross_vectors(center_frac, neighbor_frac, cell):
+    center_frac = np.asarray(center_frac, dtype=float)
+    neighbor_frac = np.asarray(neighbor_frac, dtype=float)
+    delta = neighbor_frac[None, :, None, :] - center_frac[:, None, None, :] + SHIFTS[None, None, :, :]
+    cart = np.einsum("...i,ij->...j", delta, cell)
+    dist = np.linalg.norm(cart, axis=-1)
+    image = np.argmin(dist, axis=-1)
+    rows = np.arange(len(center_frac))[:, None]
+    cols = np.arange(len(neighbor_frac))[None, :]
+    return dist[rows, cols, image], cart[rows, cols, image]
+
+
+def _soft_histogram(values, weights, bins):
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    sigma = max(float(np.diff(bins).mean()) * 0.45, 0.08)
+    values = np.asarray(values, dtype=float).reshape(-1)
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    if values.size == 0 or weights.sum() <= 1e-12:
+        return np.zeros(len(centers), dtype=float)
+    hist = (weights[:, None] * np.exp(-0.5 * ((values[:, None] - centers[None, :]) / sigma) ** 2)).sum(0)
+    return hist / max(hist.sum(), 1e-12)
+
+
+def tio2_environment_descriptor(ti_frac, o_frac, cell, cutoff=TIO_CUTOFF):
+    if len(ti_frac) < 1 or len(o_frac) < 1:
+        raise ValueError("Ti/O framework is empty.")
+    dist, vec = periodic_cross_vectors(ti_frac, o_frac, cell)
+    hard = dist <= float(cutoff)
+    if not np.any(hard):
+        raise ValueError("No Ti-O neighbours inside cutoff.")
+    ti_cn = hard.sum(1).astype(float)
+    o_cn = hard.sum(0).astype(float)
+    bond = dist[hard]
+    width = max(float(np.std(bond)), 0.03)
+    smooth = _stable_logistic_switch(dist, cutoff, max(width, 0.08))
+    angle_values, angle_weights = [], []
+    oo_values, oo_weights = [], []
+    for i in range(len(ti_frac)):
+        ids = np.flatnonzero(smooth[i] > 0.05)
+        for a in range(len(ids)):
+            j = ids[a]
+            nj = np.linalg.norm(vec[i, j])
+            for b in range(a + 1, len(ids)):
+                k = ids[b]
+                nk = np.linalg.norm(vec[i, k])
+                if min(nj, nk) <= 1e-10:
+                    continue
+                w = smooth[i, j] * smooth[i, k]
+                angle = np.degrees(np.arccos(np.clip(np.dot(vec[i, j], vec[i, k]) / (nj * nk), -1, 1)))
+                angle_values.append(angle); angle_weights.append(w)
+                oo_values.append(np.linalg.norm(vec[i, j] - vec[i, k])); oo_weights.append(w)
+    angle_profile = _soft_histogram(angle_values, angle_weights, ANGLE_BINS)
+    oo_profile = _soft_histogram(oo_values, oo_weights, OO_BINS)
+    oo_distances, _ = periodic_neighbor_vectors(o_frac, cell)
+    min_oo = min(float(d[0]) for d in oo_distances)
+    return {
+        "target_ti_o_cn": float(np.mean(ti_cn)),
+        "target_ti_o_cn_std": float(np.std(ti_cn)),
+        "target_o_ti_cn": float(np.mean(o_cn)),
+        "target_o_ti_cn_std": float(np.std(o_cn)),
+        "target_ti_o_mean": float(np.mean(bond)),
+        "target_ti_o_width": width,
+        "target_ti_o_cutoff": float(cutoff),
+        "minimum_ti_o_distance": float(np.min(dist)),
+        "minimum_o_o_distance": min_oo,
+        "oti_o_angle_profile": angle_profile,
+        "shell_o_o_profile": oo_profile,
+    }
+
+
+O_CHEMISTRY_CACHE_VERSION = 1
+
+
+def _extract_oxygen_training_record(payload):
+    row_index, row_dict, num_wps, cutoff, has_label = payload
+    row = pd.Series(row_dict)
     try:
-        constructor = SequentialOxygenConstructor(
-            _O_WORKER_TARGET,
-            n_o_max=_O_WORKER_CONFIG["n_o_max"],
-            beam_width=_O_WORKER_CONFIG["beam_width"],
-            candidates_per_site=_O_WORKER_CONFIG["candidates_per_site"],
-            max_skeletons=_O_WORKER_CONFIG["max_skeletons"],
-            seed=int(task_seed),
-        )
-        with open(os.devnull, "w") as sink, \
-                contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            result = constructor.construct(
-                global_row,
-                np.asarray(si_frac, dtype=np.float32),
-                np.asarray(cell, dtype=np.float32),
-                list(tokens),
-                progress_label="worker",
-                verbose=False,
-            )
-        return {
-            "parent_index": int(parent_index),
-            "result": result,
-            "elapsed": float(time.perf_counter() - started),
-            "error": None,
+        ti_frac, cell = ti_framework_from_row(row, num_wps)
+        o_frac = oxygen_framework_from_row(row, num_wps)
+        ti_desc = framework_descriptor(ti_frac, cell, chemistry_cutoff=CHEMISTRY_CUTOFF)
+        o_desc = tio2_environment_descriptor(ti_frac, o_frac, cell, cutoff=cutoff)
+        source = str(row["label"]) if has_label else framework_fingerprint(ti_frac, cell)
+        group = Group(int(row["spg"]))
+        o_wps = [int(row[f"wp{i}"]) for i in range(num_wps)
+                 if int(row[f"wp{i}"]) >= 0 and int(row[f"target_coord{i}"]) == O_ROLE]
+        record = {
+            "training_row": int(row_index), "source_group": source,
+            "spg": int(row["spg"]), "lattice_type": str(group.lattice_type),
+            "volume_per_ti": float(ti_desc["volume_per_ti"]),
+            "ti_ti_cn": float(ti_desc["target_ti_cn"]),
+            "ti_ti_mean": float(ti_desc["target_ti_nn_mean"]),
+            "ti_ti_width": float(ti_desc["target_ti_nn_width"]),
+            "o_skeleton_token_unpadded": encode_wp_token(o_wps),
+            "n_ti": int(len(ti_frac)), "n_o": int(len(o_frac)),
+            **{k: v for k, v in o_desc.items() if k not in {"oti_o_angle_profile", "shell_o_o_profile"}},
         }
+        for i, value in enumerate(o_desc["oti_o_angle_profile"]):
+            record[f"oti_o_angle_bin_{i}"] = float(value)
+        for i, value in enumerate(o_desc["shell_o_o_profile"]):
+            record[f"shell_o_o_bin_{i}"] = float(value)
+        return record, None
     except Exception as exc:
-        return {
-            "parent_index": int(parent_index),
-            "result": None,
-            "elapsed": float(time.perf_counter() - started),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        return None, f"{type(exc).__name__}: {exc}"
 
+
+@dataclass(frozen=True)
+class TiOChemistryTarget:
+    source_group: str
+    target_ti_o_cn: float
+    target_ti_o_cn_std: float
+    target_o_ti_cn: float
+    target_o_ti_cn_std: float
+    target_ti_o_mean: float
+    target_ti_o_width: float
+    target_ti_o_cutoff: float
+    minimum_ti_o_distance: float
+    minimum_o_o_distance: float
+    oti_o_angle_profile: np.ndarray
+    shell_o_o_profile: np.ndarray
+
+
+class OxygenTrainingDistribution:
+    def __init__(self, canonical_df, num_wps, cutoff=TIO_CUTOFF, ncpu=1,
+                 cache_csv=None, cache_meta=None, cache_key=None):
+        if cache_csv and cache_meta and os.path.exists(cache_csv) and os.path.exists(cache_meta):
+            try:
+                with open(cache_meta, "r", encoding="utf-8") as handle:
+                    meta = json.load(handle)
+                if meta.get("cache_key") == cache_key and meta.get("version") == O_CHEMISTRY_CACHE_VERSION:
+                    self.frame = pd.read_csv(cache_csv)
+                    self.failures = int(meta.get("failures", 0))
+                    print(f"Reused oxygen chemistry cache: {cache_csv}", flush=True)
+                    return
+            except Exception as exc:
+                print(f"Ignoring invalid oxygen chemistry cache: {type(exc).__name__}: {exc}", flush=True)
+        payloads = [(int(idx), row.to_dict(), int(num_wps), float(cutoff), "label" in canonical_df.columns)
+                    for idx, row in canonical_df.iterrows()]
+        records, failures = [], 0
+        print(f"Extracting Ti-O/O-O chemistry from {len(payloads)} rows with {ncpu} CPU worker(s)...", flush=True)
+        if int(ncpu) == 1:
+            iterator = map(_extract_oxygen_training_record, payloads)
+            for done, (record, error) in enumerate(iterator, 1):
+                failures += int(record is None)
+                if record is not None: records.append(record)
+                if done % 500 == 0 or done == len(payloads):
+                    print(f"O chemistry extraction: {done}/{len(payloads)}; valid={len(records)}; failures={failures}", flush=True)
+        else:
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=int(ncpu), mp_context=ctx,
+                                     initializer=set_worker_thread_limits) as pool:
+                iterator = pool.map(_extract_oxygen_training_record, payloads, chunksize=8)
+                for done, (record, error) in enumerate(iterator, 1):
+                    failures += int(record is None)
+                    if record is not None: records.append(record)
+                    if done % 500 == 0 or done == len(payloads):
+                        print(f"O chemistry extraction: {done}/{len(payloads)}; valid={len(records)}; failures={failures}", flush=True)
+        if not records:
+            raise RuntimeError("No valid Ti-O chemistry records could be extracted.")
+        self.frame = pd.DataFrame(records).sort_values("training_row").reset_index(drop=True)
+        self.failures = failures
+        if cache_csv and cache_meta:
+            self.frame.to_csv(cache_csv, index=False)
+            with open(cache_meta, "w", encoding="utf-8") as handle:
+                json.dump({"version": O_CHEMISTRY_CACHE_VERSION, "cache_key": cache_key,
+                           "failures": failures}, handle, indent=2)
+
+    def _row_to_target(self, row):
+        angles = np.asarray([row[f"oti_o_angle_bin_{i}"] for i in range(len(ANGLE_BINS)-1)], float)
+        oo = np.asarray([row[f"shell_o_o_bin_{i}"] for i in range(len(OO_BINS)-1)], float)
+        return TiOChemistryTarget(
+            source_group=str(row.source_group), target_ti_o_cn=float(row.target_ti_o_cn),
+            target_ti_o_cn_std=float(row.target_ti_o_cn_std), target_o_ti_cn=float(row.target_o_ti_cn),
+            target_o_ti_cn_std=float(row.target_o_ti_cn_std), target_ti_o_mean=float(row.target_ti_o_mean),
+            target_ti_o_width=float(row.target_ti_o_width), target_ti_o_cutoff=float(row.target_ti_o_cutoff),
+            minimum_ti_o_distance=float(row.minimum_ti_o_distance), minimum_o_o_distance=float(row.minimum_o_o_distance),
+            oti_o_angle_profile=angles, shell_o_o_profile=oo,
+        )
+
+    def sample_for_framework(self, framework, rng, nearest=64):
+        frame = self.frame
+        same = frame[frame.lattice_type == framework["lattice_type"]]
+        candidates = same if len(same) >= min(16, nearest) else frame
+        scales = {
+            "ti_ti_cn": max(float(frame.ti_ti_cn.std()), 0.5),
+            "ti_ti_mean": max(float(frame.ti_ti_mean.std()), 0.1),
+            "volume_per_ti": max(float(np.log(frame.volume_per_ti.clip(lower=1e-6)).std()), 0.1),
+        }
+        score = ((candidates.ti_ti_cn - framework["ti_ti_cn"]) / scales["ti_ti_cn"]) ** 2
+        score += ((candidates.ti_ti_mean - framework["ti_ti_mean"]) / scales["ti_ti_mean"]) ** 2
+        score += ((np.log(candidates.volume_per_ti.clip(lower=1e-6)) - math.log(max(framework["volume_per_ti"],1e-6))) / scales["volume_per_ti"]) ** 2
+        subset = candidates.loc[score.nsmallest(min(int(nearest), len(candidates))).index]
+        groups = subset.source_group.unique()
+        source = rng.choice(groups)
+        source_rows = subset[subset.source_group == source]
+        return self._row_to_target(source_rows.iloc[int(rng.integers(0, len(source_rows)))])
+
+    def learned_tokens(self, spg, n_o, max_sites):
+        subset = self.frame[(self.frame.spg == int(spg)) & (self.frame.n_o == int(n_o))]
+        tokens = []
+        for token in subset.o_skeleton_token_unpadded.astype(str):
+            values = decode_wp_token(token)
+            if len(values) <= int(max_sites): tokens.append(token)
+        return tokens
+
+
+def _canonical_o_token(values, max_sites):
+    values = sorted(int(v) for v in values)
+    return encode_wp_token(values + [-1] * (int(max_sites) - len(values)))
+
+
+def sample_legal_o_skeletons(spg, required_o, draw, max_sites, rng, learned_tokens=(), mode="exploration"):
+    group = Group(int(spg))
+    mult = [int(group[i].multiplicity) for i in range(len(group))]
+    allowed = [i for i, m in enumerate(mult) if 1 <= m <= required_o]
+    learned = []
+    for token in learned_tokens:
+        vals = [w for w in decode_wp_token(token) if w >= 0]
+        if len(vals) <= max_sites and sum(mult[w] for w in vals) == required_o:
+            learned.append(_canonical_o_token(vals, max_sites))
+    learned = list(dict.fromkeys(learned))
+    if mode == "interpolation": n_l, n_e = draw, 0
+    elif mode == "exploration": n_l, n_e = 0, draw
+    elif mode == "mixed": n_l, n_e = draw // 2, draw - draw // 2
+    else: raise ValueError(f"Unsupported oxygen proposal mode: {mode}")
+    proposals = []
+    if n_l and learned:
+        order = rng.permutation(len(learned))
+        for i in order[:min(n_l, len(learned))]: proposals.append((learned[int(i)], "interpolation"))
+    elif n_l:
+        n_e += n_l
+
+    # Enumerate exact multiplicity multisets with replacement. Repeated Wyckoff
+    # classes are legal because they represent separate independent orbits.
+    legal = []
+    cap = max(5000, 200 * max(1, draw))
+    def visit(start, remaining, picked):
+        if len(legal) >= cap: return
+        if remaining == 0:
+            if picked: legal.append(_canonical_o_token(picked, max_sites))
+            return
+        if len(picked) >= max_sites: return
+        slots_left = max_sites - len(picked)
+        for pos in range(start, len(allowed)):
+            w = allowed[pos]; m = mult[w]
+            if m > remaining: continue
+            rem = remaining - m
+            if rem and slots_left <= 1: continue
+            visit(pos, rem, picked + [w])
+            if len(legal) >= cap: return
+    visit(0, int(required_o), [])
+    legal = list(dict.fromkeys(legal))
+    existing = {x[0] for x in proposals}
+    legal = [token for token in legal if token not in existing]
+    if legal and n_e:
+        order = rng.permutation(len(legal))
+        proposals.extend((legal[int(i)], "exploration") for i in order[:min(n_e, len(legal))])
+    if mode == "mixed" and len(proposals) > 1: rng.shuffle(proposals)
+    return proposals[:draw]
+
+
+class TorchSymmetryConstrainedOBuilder:
+    def __init__(self, initializations=8, screen_steps=25, refine_starts=2, refine_steps=60,
+                 ti_cn_tolerance=0.75, o_cn_tolerance=0.75, distance_tolerance=0.35,
+                 minimum_ti_o=1.45, minimum_o_o=1.6, maximum_loss=8.0,
+                 max_neighbors=12, lr=0.06, device=None, seed=42):
+        self.initializations=int(initializations); self.screen_steps=int(screen_steps)
+        self.refine_starts=int(refine_starts); self.refine_steps=int(refine_steps)
+        self.ti_cn_tolerance=float(ti_cn_tolerance); self.o_cn_tolerance=float(o_cn_tolerance)
+        self.distance_tolerance=float(distance_tolerance); self.minimum_ti_o=float(minimum_ti_o)
+        self.minimum_o_o=float(minimum_o_o); self.maximum_loss=float(maximum_loss)
+        self.max_neighbors=int(max_neighbors); self.lr=float(lr)
+        self.device=torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.rng=np.random.default_rng(seed); self._template_cache={}
+        self._shifts=torch.as_tensor(SHIFTS,dtype=torch.float32,device=self.device)
+
+    @staticmethod
+    def _affine_map(function, dof):
+        zero=np.asarray(function(np.zeros(dof)),float); matrix=np.zeros((3,dof),float)
+        for k in range(dof):
+            x=np.zeros(dof); x[k]=0.137; y=np.asarray(function(x),float)
+            matrix[:,k]=((y-zero+0.5)%1.0-0.5)/0.137
+        return matrix,zero
+
+    def _template(self, spg, token):
+        key=(int(spg),str(token))
+        if key in self._template_cache: return self._template_cache[key]
+        group=Group(int(spg)); wps=tuple(w for w in decode_wp_token(token) if w>=0)
+        if not wps: return None
+        site_dofs=[]; orbit_rot=[]; orbit_trans=[]; gen_A=[]; gen_b=[]
+        for w in wps:
+            wp=group[w]; dof=int(wp.get_dof()); site_dofs.append(dof)
+            A,b=self._affine_map(lambda u,wp=wp:wp.get_position_from_free_xyzs(u),dof)
+            gen_A.append(torch.tensor(A,dtype=torch.float32,device=self.device)); gen_b.append(torch.tensor(b,dtype=torch.float32,device=self.device))
+            rots=[]; trans=[]
+            for op in wp.ops:
+                o=np.asarray(op.operate([0.,0.,0.]),float); cols=[]
+                for axis in range(3):
+                    e=np.zeros(3); e[axis]=0.173; q=np.asarray(op.operate(e),float)
+                    cols.append(((q-o+0.5)%1.0-0.5)/0.173)
+                rots.append(np.stack(cols,axis=1)); trans.append(o)
+            orbit_rot.append(torch.tensor(np.asarray(rots),dtype=torch.float32,device=self.device))
+            orbit_trans.append(torch.tensor(np.asarray(trans),dtype=torch.float32,device=self.device))
+        out={'wps':wps,'site_dofs':tuple(site_dofs),'gen_A':gen_A,'gen_b':gen_b,
+             'orbit_rot':orbit_rot,'orbit_trans':orbit_trans,
+             'n_o':sum(int(group[w].multiplicity) for w in wps)}
+        self._template_cache[key]=out; return out
+
+    def _expand(self, template, raw):
+        B=raw.shape[0]; cursor=0; frac=[]; free=[]
+        for dof,A,b,R,t in zip(template['site_dofs'],template['gen_A'],template['gen_b'],template['orbit_rot'],template['orbit_trans']):
+            u=torch.sigmoid(raw[:,cursor:cursor+dof]); cursor+=dof; free.append(u)
+            gen=(u@A.T+b)%1.0
+            orbit=(torch.einsum('oij,bj->boi',R,gen)+t[None,:,:])%1.0
+            frac.append(orbit)
+        return torch.cat(frac,1),free
+
+    def _geometry(self, template, framework, target, raw, include_topology):
+        o_frac,free=self._expand(template,raw); B,No=o_frac.shape[:2]
+        ti=torch.as_tensor(framework['ti_frac'],dtype=torch.float32,device=self.device)
+        cell=torch.as_tensor(framework['cell'],dtype=torch.float32,device=self.device)
+        Nt=ti.shape[0]
+        delta=o_frac[:,None,:,None,:]-ti[None,:,None,None,:]+self._shifts[None,None,None,:,:]
+        vec_all=torch.einsum('btosk,kl->btosl',delta,cell)
+        dist_all=torch.linalg.norm(vec_all,dim=-1).clamp_min(1e-6)
+        dist,image=dist_all.min(-1)
+        vec=torch.gather(vec_all,3,image[...,None,None].expand(-1,-1,-1,1,3)).squeeze(3)
+        width=max(float(target.target_ti_o_width),0.08); cutoff=float(target.target_ti_o_cutoff)
+        w=torch.sigmoid((cutoff-dist)/width)
+        ti_cn=w.sum(-1); o_cn=w.sum(1)
+        ti_cn_loss=((ti_cn-float(target.target_ti_o_cn))**2).mean(1)
+        o_cn_loss=((o_cn-float(target.target_o_ti_cn))**2).mean(1)
+        denom=w.sum((1,2)).clamp_min(1e-6)
+        mean=(w*dist).sum((1,2))/denom
+        var=(w*(dist-mean[:,None,None])**2).sum((1,2))/denom
+        distance_loss=((mean-float(target.target_ti_o_mean))/max(width,0.12))**2
+        distance_loss+=0.5*((torch.sqrt(var+1e-8)-float(target.target_ti_o_width))/max(width,0.12))**2
+        min_tio=dist.amin((1,2)); tio_overlap=torch.relu(self.minimum_ti_o-min_tio).pow(2)/max(self.minimum_ti_o**2,0.1)
+        d_oo=o_frac[:,:,None,None,:]-o_frac[:,None,:,None,:]+self._shifts[None,None,None,:,:]
+        v_oo=torch.einsum('bijnk,kl->bijnl',d_oo,cell); r_oo=torch.linalg.norm(v_oo,dim=-1).clamp_min(1e-6)
+        eye=torch.eye(No,device=self.device,dtype=torch.bool)[None,:,:,None]
+        zero=(torch.arange(27,device=self.device)==ZERO_SHIFT)[None,None,None,:]
+        r_oo=r_oo.masked_fill(eye & zero,1e6)
+        min_oo=r_oo.amin((1,2,3)); oo_overlap=torch.relu(self.minimum_o_o-min_oo).pow(2)/max(self.minimum_o_o**2,0.1)
+        angle_loss=torch.zeros(B,device=self.device); shell_oo_loss=torch.zeros(B,device=self.device)
+        if include_topology:
+            K=min(self.max_neighbors,No); topd,idx=torch.topk(dist,K,dim=-1,largest=False)
+            topv=torch.gather(vec,2,idx[...,None].expand(-1,-1,-1,3))
+            norm=torch.linalg.norm(topv,dim=-1).clamp_min(1e-6)
+            cos=torch.einsum('btik,btjk->btij',topv,topv)/(norm[:,:,:,None]*norm[:,:,None,:])
+            pw=torch.sigmoid((cutoff-topd)/width); pairw=pw[:,:,:,None]*pw[:,:,None,:]
+            tri=torch.triu(torch.ones((K,K),device=self.device,dtype=torch.bool),diagonal=1)
+            cosv=cos[:,:,tri]; pvw=pairw[:,:,tri]
+            centers=torch.cos(torch.tensor(0.5*(ANGLE_BINS[:-1]+ANGLE_BINS[1:])*math.pi/180,device=self.device))
+            ah=(pvw[...,None]*torch.exp(-0.5*((cosv[...,None]-centers)/0.16)**2)).sum((1,2))
+            ah=ah/ah.sum(-1,keepdim=True).clamp_min(1e-8)
+            at=torch.tensor(target.oti_o_angle_profile,dtype=torch.float32,device=self.device)
+            angle_loss=((ah-at[None,:])**2).mean(-1)*len(at)
+            pairdist=torch.linalg.norm(topv[:,:,:,None,:]-topv[:,:,None,:,:],dim=-1)[:,:,tri]
+            oc=torch.tensor(0.5*(OO_BINS[:-1]+OO_BINS[1:]),dtype=torch.float32,device=self.device)
+            osig=max(float(np.diff(OO_BINS).mean())*0.45,0.08)
+            oh=(pvw[...,None]*torch.exp(-0.5*((pairdist[...,None]-oc)/osig)**2)).sum((1,2))
+            oh=oh/oh.sum(-1,keepdim=True).clamp_min(1e-8)
+            ot=torch.tensor(target.shell_o_o_profile,dtype=torch.float32,device=self.device)
+            shell_oo_loss=((oh-ot[None,:])**2).mean(-1)*len(ot)
+        total=ti_cn_loss+0.6*o_cn_loss+distance_loss+0.7*angle_loss+0.4*shell_oo_loss+6.0*tio_overlap+6.0*oo_overlap
+        detail={'ti_cn_loss':ti_cn_loss,'o_cn_loss':o_cn_loss,'distance_loss':distance_loss,
+                'angle_loss':angle_loss,'shell_o_o_loss':shell_oo_loss,'ti_o_overlap_loss':tio_overlap,
+                'o_o_overlap_loss':oo_overlap,'achieved_ti_o_cn':ti_cn.mean(1),'ti_o_cn_std':ti_cn.std(1,unbiased=False),
+                'achieved_o_ti_cn':o_cn.mean(1),'o_ti_cn_std':o_cn.std(1,unbiased=False),
+                'achieved_ti_o_mean':mean,'achieved_ti_o_width':torch.sqrt(var+1e-8),
+                'minimum_ti_o_distance':min_tio,'minimum_o_o_distance':min_oo,
+                'ti_cn_q90_error':torch.quantile(torch.abs(ti_cn-float(target.target_ti_o_cn)),0.9,dim=1),
+                'o_cn_q90_error':torch.quantile(torch.abs(o_cn-float(target.target_o_ti_cn)),0.9,dim=1)}
+        return total,detail,(o_frac,free)
+
+    def _optimize(self,template,framework,target,raw,steps,include_topology):
+        if raw.shape[1] == 0:
+            return raw.detach()
+        raw=raw.detach().clone().requires_grad_(True); opt=torch.optim.Adam([raw],lr=self.lr)
+        for _ in range(int(steps)):
+            opt.zero_grad(set_to_none=True); total,_,_=self._geometry(template,framework,target,raw,include_topology)
+            total.mean().backward(); torch.nn.utils.clip_grad_norm_([raw],10.0); opt.step()
+        return raw.detach()
+
+    def build(self,framework,token,target,sample_id):
+        template=self._template(framework['spg'],token)
+        if template is None or template['n_o'] != 2*len(framework['ti_frac']): return None,[]
+        nvar=sum(template['site_dofs']); raw=torch.randn((self.initializations,nvar),device=self.device)
+        raw=self._optimize(template,framework,target,raw,self.screen_steps,False)
+        scores=[]
+        with torch.no_grad():
+            for i in range(len(raw)):
+                val,_,_=self._geometry(template,framework,target,raw[i:i+1],False); scores.append(float(val[0]))
+        order=np.argsort(scores)[:min(self.refine_starts,len(scores))]
+        refined=self._optimize(template,framework,target,raw[order],self.refine_steps,True)
+        attempts=[]
+        with torch.no_grad():
+            for rank in range(len(refined)):
+                total,detail,geom=self._geometry(template,framework,target,refined[rank:rank+1],True)
+                o_frac,free=geom; free_np=np.zeros((len(template['wps']),3),float)
+                for j,u in enumerate(free): free_np[j,:u.shape[1]]=u[0].cpu().numpy()
+                item={'sample_id':sample_id,'initialization_id':int(order[rank]),'screen_rank':rank,
+                      'screen_loss':float(scores[order[rank]]),'success':bool(torch.isfinite(total[0])),
+                      'total_loss':float(total[0]),'o_free':free_np,'o_frac':o_frac[0].cpu().numpy()}
+                for k,v in detail.items(): item[k]=float(v[0])
+                item['ti_cn_error']=abs(item['achieved_ti_o_cn']-target.target_ti_o_cn)
+                item['o_cn_error']=abs(item['achieved_o_ti_cn']-target.target_o_ti_cn)
+                item['distance_error']=abs(item['achieved_ti_o_mean']-target.target_ti_o_mean)
+                item['chemistry_success']=bool(item['success'] and item['ti_cn_error']<=self.ti_cn_tolerance and
+                    item['o_cn_error']<=self.o_cn_tolerance and item['distance_error']<=self.distance_tolerance and
+                    item['minimum_ti_o_distance']>=self.minimum_ti_o and item['minimum_o_o_distance']>=self.minimum_o_o and
+                    item['total_loss']<=self.maximum_loss)
+                attempts.append(item)
+        attempts.sort(key=lambda x:(not x['chemistry_success'],x['ti_cn_error'],x['distance_error'],x['total_loss']))
+        return (next((x for x in attempts if x['chemistry_success']),attempts[0] if attempts else None),attempts)
+
+
+
+
+
+
+def phase_a_row_to_framework(row, diag, num_wps):
+    spg=int(row['spg']); group=Group(spg); ti_frac=[]; ti_wps=[]
+    for i in range(num_wps):
+        if int(row.get(f'target_coord{i}',0)) != TI_ROLE: continue
+        wp=int(row[f'wp{i}']); ti_wps.append(wp)
+        xyz=np.asarray([row[f'x{i}'],row[f'y{i}'],row[f'z{i}']],float)
+        ti_frac.extend(_deduplicate_fractional([op.operate(xyz) for op in group[wp].ops]).tolist())
+    ti_frac=_deduplicate_fractional(ti_frac); cell=_cell_matrix(np.asarray([row[c] for c in BASE_COLUMNS[1:]],float))
+    desc=framework_descriptor(ti_frac,cell)
+    return {'spg':spg,'lattice_type':str(group.lattice_type),'cell':cell,'ti_frac':ti_frac,
+            'ti_wps':ti_wps,'ti_ti_cn':float(desc['target_ti_cn']),'ti_ti_mean':float(desc['target_ti_nn_mean']),
+            'volume_per_ti':float(desc['volume_per_ti']),'row':dict(row),'phase_a_diag':diag}
+
+
+def build_complete_output_row(framework, oxygen_result, token, num_wps):
+    record=dict(framework['row']); sites=[]
+    for i,wp in enumerate(framework['ti_wps']):
+        xyz=np.asarray([record[f'x{i}'],record[f'y{i}'],record[f'z{i}']],float); sites.append((wp,xyz,TI_ROLE))
+    o_wps=[w for w in decode_wp_token(token) if w>=0]
+    for i,wp in enumerate(o_wps):
+        xyz=_wyckoff_position_from_parameters(framework['spg'],wp,oxygen_result['o_free'][i]); sites.append((wp,xyz,O_ROLE))
+    if len(sites)>num_wps: raise ValueError(f"Complete structure needs {len(sites)} independent sites, capacity is {num_wps}.")
+    sites += [(-1,np.full(3,-1.0),0)]*(num_wps-len(sites))
+    for i,(wp,xyz,role) in enumerate(sites):
+        record[f'wp{i}']=int(wp); record[f'target_coord{i}']=int(role)
+        record[f'x{i}'],record[f'y{i}'],record[f'z{i}']=map(float,xyz)
+    return record
+
+
+def save_tio2_cif(framework,oxygen_result,path):
+    frac=np.vstack([framework['ti_frac'],oxygen_result['o_frac']]); symbols=['Ti']*len(framework['ti_frac'])+['O']*len(oxygen_result['o_frac'])
+    write(path,Atoms(symbols,scaled_positions=frac,cell=framework['cell'],pbc=True),format='cif')
+
+def oxygen_candidate_score(item,target):
+    return (not item.get('chemistry_success',False),
+            abs(float(item.get('achieved_ti_o_cn',1e9))-float(target.target_ti_o_cn)),
+            abs(float(item.get('achieved_ti_o_mean',1e9))-float(target.target_ti_o_mean)),
+            float(item.get('angle_loss',1e9)),float(item.get('shell_o_o_loss',1e9)),
+            float(item.get('total_loss',1e9)))
+
+
+
+
+
+
+def _safe_r2(target, achieved):
+    target = np.asarray(target, dtype=float)
+    achieved = np.asarray(achieved, dtype=float)
+    mask = np.isfinite(target) & np.isfinite(achieved)
+    target, achieved = target[mask], achieved[mask]
+    if target.size < 2:
+        return np.nan
+    denom = float(np.sum((target - np.mean(target)) ** 2))
+    if denom <= 1e-14:
+        return np.nan
+    return float(1.0 - np.sum((achieved - target) ** 2) / denom)
+
+
+def _error_summary(target, achieved):
+    target = np.asarray(target, dtype=float)
+    achieved = np.asarray(achieved, dtype=float)
+    mask = np.isfinite(target) & np.isfinite(achieved)
+    target, achieved = target[mask], achieved[mask]
+    if target.size == 0:
+        return {"n": 0, "mae": np.nan, "rmse": np.nan, "bias": np.nan,
+                "q50_abs_error": np.nan, "q90_abs_error": np.nan,
+                "q95_abs_error": np.nan, "r2": np.nan}
+    err = achieved - target
+    ae = np.abs(err)
+    return {
+        "n": int(target.size),
+        "mae": float(np.mean(ae)),
+        "rmse": float(np.sqrt(np.mean(err ** 2))),
+        "bias": float(np.mean(err)),
+        "q50_abs_error": float(np.quantile(ae, 0.50)),
+        "q90_abs_error": float(np.quantile(ae, 0.90)),
+        "q95_abs_error": float(np.quantile(ae, 0.95)),
+        "r2": _safe_r2(target, achieved),
+    }
+
+
+def _jensen_shannon(p, q):
+    p = np.asarray(p, dtype=float)
+    q = np.asarray(q, dtype=float)
+    p = np.clip(p, 0.0, None); q = np.clip(q, 0.0, None)
+    ps, qs = float(p.sum()), float(q.sum())
+    if ps <= 1e-15 and qs <= 1e-15:
+        return 0.0
+    if ps <= 1e-15 or qs <= 1e-15:
+        return math.log(2.0)
+    p, q = p / ps, q / qs
+    m = 0.5 * (p + q)
+    def kl(a, b):
+        mask = a > 0
+        return float(np.sum(a[mask] * np.log(a[mask] / b[mask])))
+    return 0.5 * kl(p, m) + 0.5 * kl(q, m)
+
+
+def _empirical_wasserstein_1(a, b):
+    a = np.sort(np.asarray(a, dtype=float)); b = np.sort(np.asarray(b, dtype=float))
+    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
+    if a.size == 0 or b.size == 0:
+        return np.nan
+    grid = np.unique(np.concatenate([a, b]))
+    if grid.size < 2:
+        return 0.0
+    cdf_a = np.searchsorted(a, grid, side="right") / a.size
+    cdf_b = np.searchsorted(b, grid, side="right") / b.size
+    return float(np.sum(np.abs(cdf_a[:-1] - cdf_b[:-1]) * np.diff(grid)))
+
+
+def _ks_statistic(a, b):
+    a = np.sort(np.asarray(a, dtype=float)); b = np.sort(np.asarray(b, dtype=float))
+    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
+    if a.size == 0 or b.size == 0:
+        return np.nan
+    grid = np.unique(np.concatenate([a, b]))
+    cdf_a = np.searchsorted(a, grid, side="right") / a.size
+    cdf_b = np.searchsorted(b, grid, side="right") / b.size
+    return float(np.max(np.abs(cdf_a - cdf_b)))
+
+
+def evaluate_pre_relaxation(final_rows, final_diag, selected_indices, num_wps,
+                            oxygen_training, output_folder, cutoff):
+    """Evaluate raw symmetry-constrained TiO2 candidates before decoding/relaxation."""
+    metric_rows = []
+    selected_index_set = set(int(i) for i in selected_indices)
+    angle_target_cols = [f"target_angle_bin_{i}" for i in range(len(ANGLE_BINS) - 1)]
+    angle_ach_cols = [f"achieved_angle_bin_{i}" for i in range(len(ANGLE_BINS) - 1)]
+    oo_target_cols = [f"target_shell_o_o_bin_{i}" for i in range(len(OO_BINS) - 1)]
+    oo_ach_cols = [f"achieved_shell_o_o_bin_{i}" for i in range(len(OO_BINS) - 1)]
+    for pool_index, (row, diag) in enumerate(zip(final_rows, final_diag)):
+        series = pd.Series(row)
+        ti_frac, cell = ti_framework_from_row(series, num_wps)
+        o_frac = oxygen_framework_from_row(series, num_wps)
+        achieved = tio2_environment_descriptor(ti_frac, o_frac, cell, cutoff=float(cutoff))
+        record = {
+            "candidate_id": int(diag["candidate_id"]),
+            "pool_index": int(pool_index),
+            "selected": bool(pool_index in selected_index_set),
+            "final_rank": np.nan,
+            "spg": int(diag["spg"]),
+            "ranking_score": float(diag["ranking_score"]),
+            "total_loss": float(diag["total_loss"]),
+            "target_ti_o_cn": float(diag["target_ti_o_cn"]),
+            "achieved_ti_o_cn": float(achieved["target_ti_o_cn"]),
+            "target_ti_o_cn_std": float(diag["target_ti_o_cn_std"]),
+            "achieved_ti_o_cn_std": float(achieved["target_ti_o_cn_std"]),
+            "target_o_ti_cn": float(diag["target_o_ti_cn"]),
+            "achieved_o_ti_cn": float(achieved["target_o_ti_cn"]),
+            "target_o_ti_cn_std": float(diag["target_o_ti_cn_std"]),
+            "achieved_o_ti_cn_std": float(achieved["target_o_ti_cn_std"]),
+            "target_ti_o_mean": float(diag["target_ti_o_mean"]),
+            "achieved_ti_o_mean": float(achieved["target_ti_o_mean"]),
+            "target_ti_o_width": float(diag["target_ti_o_width"]),
+            "achieved_ti_o_width": float(achieved["target_ti_o_width"]),
+            "minimum_ti_o_distance": float(achieved["minimum_ti_o_distance"]),
+            "minimum_o_o_distance": float(achieved["minimum_o_o_distance"]),
+        }
+        target_angle = np.asarray([diag[c] for c in angle_target_cols], dtype=float)
+        target_oo = np.asarray([diag[c] for c in oo_target_cols], dtype=float)
+        achieved_angle = np.asarray(achieved["oti_o_angle_profile"], dtype=float)
+        achieved_oo = np.asarray(achieved["shell_o_o_profile"], dtype=float)
+        record["angle_jsd"] = _jensen_shannon(target_angle, achieved_angle)
+        record["shell_o_o_jsd"] = _jensen_shannon(target_oo, achieved_oo)
+        record.update({c: float(v) for c, v in zip(angle_target_cols, target_angle)})
+        record.update({c: float(v) for c, v in zip(angle_ach_cols, achieved_angle)})
+        record.update({c: float(v) for c, v in zip(oo_target_cols, target_oo)})
+        record.update({c: float(v) for c, v in zip(oo_ach_cols, achieved_oo)})
+        metric_rows.append(record)
+    metrics = pd.DataFrame(metric_rows)
+    rank_lookup = {int(pool_idx): rank + 1 for rank, pool_idx in enumerate(selected_indices)}
+    metrics["final_rank"] = [rank_lookup.get(int(i), np.nan) for i in metrics["pool_index"]]
+    metrics.to_csv(os.path.join(output_folder, "pre_relaxation_candidate_metrics.csv"), index=False)
+
+    scalar_pairs = [
+        ("ti_o_cn", "target_ti_o_cn", "achieved_ti_o_cn"),
+        ("ti_o_cn_std", "target_ti_o_cn_std", "achieved_ti_o_cn_std"),
+        ("o_ti_cn", "target_o_ti_cn", "achieved_o_ti_cn"),
+        ("o_ti_cn_std", "target_o_ti_cn_std", "achieved_o_ti_cn_std"),
+        ("ti_o_mean", "target_ti_o_mean", "achieved_ti_o_mean"),
+        ("ti_o_width", "target_ti_o_width", "achieved_ti_o_width"),
+    ]
+    summary_rows = []
+    for population, frame in (("accepted_pool", metrics), ("selected", metrics[metrics.selected])):
+        for metric, target_col, achieved_col in scalar_pairs:
+            rec = {"population": population, "metric": metric, "metric_type": "target_realization"}
+            rec.update(_error_summary(frame[target_col], frame[achieved_col]))
+            rec.update(wasserstein_1=np.nan, ks_statistic=np.nan, jsd=np.nan)
+            summary_rows.append(rec)
+        for metric in ("angle_jsd", "shell_o_o_jsd", "ranking_score", "total_loss",
+                       "minimum_ti_o_distance", "minimum_o_o_distance"):
+            values = frame[metric].to_numpy(float)
+            summary_rows.append({
+                "population": population, "metric": metric, "metric_type": "distribution_summary",
+                "n": int(np.isfinite(values).sum()), "mae": np.nan, "rmse": np.nan, "bias": np.nan,
+                "q50_abs_error": float(np.nanquantile(values, 0.50)),
+                "q90_abs_error": float(np.nanquantile(values, 0.90)),
+                "q95_abs_error": float(np.nanquantile(values, 0.95)), "r2": np.nan,
+                "wasserstein_1": np.nan, "ks_statistic": np.nan, "jsd": np.nan,
+            })
+
+        training_frame = oxygen_training.frame
+        distribution_pairs = [
+            ("ti_o_cn", "achieved_ti_o_cn", "target_ti_o_cn"),
+            ("ti_o_cn_std", "achieved_ti_o_cn_std", "target_ti_o_cn_std"),
+            ("o_ti_cn", "achieved_o_ti_cn", "target_o_ti_cn"),
+            ("o_ti_cn_std", "achieved_o_ti_cn_std", "target_o_ti_cn_std"),
+            ("ti_o_mean", "achieved_ti_o_mean", "target_ti_o_mean"),
+            ("ti_o_width", "achieved_ti_o_width", "target_ti_o_width"),
+        ]
+        for metric, generated_col, training_col in distribution_pairs:
+            summary_rows.append({
+                "population": population, "metric": metric, "metric_type": "training_distribution",
+                "n": int(len(frame)), "mae": np.nan, "rmse": np.nan, "bias": np.nan,
+                "q50_abs_error": np.nan, "q90_abs_error": np.nan, "q95_abs_error": np.nan,
+                "r2": np.nan,
+                "wasserstein_1": _empirical_wasserstein_1(frame[generated_col], training_frame[training_col]),
+                "ks_statistic": _ks_statistic(frame[generated_col], training_frame[training_col]),
+                "jsd": np.nan,
+            })
+        train_angle = training_frame[[f"oti_o_angle_bin_{i}" for i in range(len(ANGLE_BINS)-1)]].to_numpy(float).mean(0)
+        train_oo = training_frame[[f"shell_o_o_bin_{i}" for i in range(len(OO_BINS)-1)]].to_numpy(float).mean(0)
+        gen_angle = frame[angle_ach_cols].to_numpy(float).mean(0)
+        gen_oo = frame[oo_ach_cols].to_numpy(float).mean(0)
+        summary_rows.extend([
+            {"population": population, "metric": "angle_profile", "metric_type": "training_distribution",
+             "n": int(len(frame)), "mae": np.nan, "rmse": np.nan, "bias": np.nan,
+             "q50_abs_error": np.nan, "q90_abs_error": np.nan, "q95_abs_error": np.nan, "r2": np.nan,
+             "wasserstein_1": np.nan, "ks_statistic": np.nan, "jsd": _jensen_shannon(gen_angle, train_angle)},
+            {"population": population, "metric": "shell_o_o_profile", "metric_type": "training_distribution",
+             "n": int(len(frame)), "mae": np.nan, "rmse": np.nan, "bias": np.nan,
+             "q50_abs_error": np.nan, "q90_abs_error": np.nan, "q95_abs_error": np.nan, "r2": np.nan,
+             "wasserstein_1": np.nan, "ks_statistic": np.nan, "jsd": _jensen_shannon(gen_oo, train_oo)},
+        ])
+
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv(os.path.join(output_folder, "pre_relaxation_metrics_summary.csv"), index=False)
+    with open(os.path.join(output_folder, "pre_relaxation_metrics_summary.json"), "w", encoding="utf-8") as handle:
+        json_ready = summary.astype(object).where(pd.notna(summary), None).to_dict(orient="records")
+        json.dump(json_ready, handle, indent=2)
+
+    print("Pre-relaxation target-realization metrics (accepted pool -> selected):", flush=True)
+    for metric, _, _ in scalar_pairs:
+        pool_rec = summary[(summary.population == "accepted_pool") & (summary.metric == metric) &
+                           (summary.metric_type == "target_realization")].iloc[0]
+        sel_rec = summary[(summary.population == "selected") & (summary.metric == metric) &
+                          (summary.metric_type == "target_realization")].iloc[0]
+        print(f"  {metric:14s} MAE {pool_rec.mae:.6g} -> {sel_rec.mae:.6g}; "
+              f"q90 {pool_rec.q90_abs_error:.6g} -> {sel_rec.q90_abs_error:.6g}", flush=True)
+    for metric in ("angle_jsd", "shell_o_o_jsd", "ranking_score"):
+        pool_rec = summary[(summary.population == "accepted_pool") & (summary.metric == metric) &
+                           (summary.metric_type == "distribution_summary")].iloc[0]
+        sel_rec = summary[(summary.population == "selected") & (summary.metric == metric) &
+                          (summary.metric_type == "distribution_summary")].iloc[0]
+        print(f"  {metric:14s} median {pool_rec.q50_abs_error:.6g} -> {sel_rec.q50_abs_error:.6g}; "
+              f"q90 {pool_rec.q90_abs_error:.6g} -> {sel_rec.q90_abs_error:.6g}", flush=True)
+    return {
+        "candidate_metrics_csv": os.path.join(output_folder, "pre_relaxation_candidate_metrics.csv"),
+        "summary_csv": os.path.join(output_folder, "pre_relaxation_metrics_summary.csv"),
+        "summary_json": os.path.join(output_folder, "pre_relaxation_metrics_summary.json"),
+    }
+
+
+@dataclass
+class StreamingTiState:
+    target_id: int
+    target: TiChemistryTarget
+    cycle: int = 0
+    attempted: set | None = None
+    elites: list | None = None
+    cycle_pool: list | None = None
+    proposals: list | None = None
+    submitted: int = 0
+    returned: int = 0
+
+    def __post_init__(self):
+        self.attempted = set() if self.attempted is None else self.attempted
+        self.elites = [] if self.elites is None else self.elites
+        self.cycle_pool = [] if self.cycle_pool is None else self.cycle_pool
+        self.proposals = [] if self.proposals is None else self.proposals
+
+
+@dataclass
+class StreamingOState:
+    target_id: int
+    phase_a_sample_id: int
+    framework: dict
+    target: TiOChemistryTarget
+    cycle: int = 0
+    attempted: set | None = None
+    cycle_pool: list | None = None
+    proposals: list | None = None
+    submitted: int = 0
+    returned: int = 0
+    no_legal_proposals: bool = False
+
+    def __post_init__(self):
+        self.attempted = set() if self.attempted is None else self.attempted
+        self.cycle_pool = [] if self.cycle_pool is None else self.cycle_pool
+        self.proposals = [] if self.proposals is None else self.proposals
+
+
+def _streaming_builder_worker(worker_id, device_id, task_queue, result_queue, ti_builder_config, o_builder_config):
+    """Persistent worker owning both Phase-A and Phase-B builders on one device."""
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    torch.set_num_threads(1)
+    if device_id is None:
+        device = "cpu"
+    else:
+        torch.cuda.set_device(int(device_id))
+        device = f"cuda:{int(device_id)}"
+    ti_builder = TorchSymmetryConstrainedTiBuilder(device=device, **ti_builder_config)
+    o_builder = TorchSymmetryConstrainedOBuilder(device=device, **o_builder_config)
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+        stage = str(task.get("stage"))
+        task_id = int(task["task_id"])
+        seed = int(task["seed"])
+        try:
+            torch.manual_seed(seed)
+            np.random.seed(seed % (2**32 - 1))
+            if device_id is not None:
+                torch.cuda.manual_seed_all(seed)
+            if stage == "ti":
+                selected, attempts = ti_builder.build(
+                    int(task["spg"]), str(task["token"]), task["target"], task_id
+                )
+                result_queue.put({
+                    "stage": "ti", "worker_id": worker_id, "task_id": task_id,
+                    "target_id": int(task["target_id"]), "cycle": int(task["cycle"]),
+                    "proposal_slot": int(task["proposal_slot"]),
+                    "spg": int(task["spg"]), "token": str(task["token"]),
+                    "proposal_source": str(task["proposal_source"]),
+                    "selected": selected, "attempts": attempts, "error": None,
+                })
+            elif stage == "oxygen":
+                selected, attempts = o_builder.build(
+                    task["framework"], str(task["token"]), task["target"], task_id
+                )
+                result_queue.put({
+                    "stage": "oxygen", "worker_id": worker_id, "task_id": task_id,
+                    "target_id": int(task["target_id"]), "cycle": int(task["cycle"]),
+                    "proposal_slot": int(task["proposal_slot"]),
+                    "token": str(task["token"]),
+                    "proposal_source": str(task["proposal_source"]),
+                    "selected": selected, "attempts": attempts, "error": None,
+                })
+            else:
+                raise ValueError(f"Unknown streaming task stage: {stage!r}")
+        except Exception as exc:
+            base = {
+                "stage": stage, "worker_id": worker_id, "task_id": task_id,
+                "target_id": int(task.get("target_id", -1)),
+                "cycle": int(task.get("cycle", -1)),
+                "proposal_slot": int(task.get("proposal_slot", -1)),
+                "proposal_source": str(task.get("proposal_source", "unknown")),
+                "selected": None, "attempts": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            if stage == "ti":
+                base.update({"spg": int(task.get("spg", -1)), "token": str(task.get("token", ""))})
+            elif stage == "oxygen":
+                base.update({"token": str(task.get("token", ""))})
+            result_queue.put(base)
+
+
+class StreamingBuilderPool:
+    def __init__(self, ngpu, ti_builder_config, o_builder_config, max_in_flight):
+        self.ctx = mp.get_context("spawn")
+        self.task_queue = self.ctx.Queue(maxsize=max(4, int(max_in_flight) + max(1, int(ngpu))))
+        self.result_queue = self.ctx.Queue()
+        self.processes = []
+        devices = list(range(ngpu)) if ngpu > 0 else [None]
+        for worker_id, device_id in enumerate(devices):
+            process = self.ctx.Process(
+                target=_streaming_builder_worker,
+                args=(worker_id, device_id, self.task_queue, self.result_queue,
+                      ti_builder_config, o_builder_config),
+                daemon=True,
+            )
+            process.start()
+            self.processes.append(process)
+
+    @property
+    def workers(self):
+        return len(self.processes)
+
+    def submit(self, task):
+        self.task_queue.put(task)
+
+    def get(self):
+        return self.result_queue.get()
+
+    def close(self):
+        for _ in self.processes:
+            self.task_queue.put(None)
+        for process in self.processes:
+            process.join()
+        self.task_queue.close()
+        self.result_queue.close()
+
+
+def run_streaming_phase_ab(args, canonical, num_wps, n_ti_max, ncpu, ngpu, output_folder,
+                           data_name, cache_key, model, training, timings, global_seed):
+    """Bounded streaming Phase-A -> Phase-B scheduler.
+
+    The only production target is the final number of complete TiO2 structures.
+    Ti frameworks are generated only to keep the oxygen parent pool populated.
+    GPU submissions are bounded by gpu_queue_depth * number_of_workers.
+    """
+    rng = np.random.default_rng(global_seed + 31)
+    composition = parse_composition(args.composition)
+    ti_folder = os.path.join(output_folder, "pre_o_ti")
+    oxygen_folder = os.path.join(output_folder, "pre_joint_tio2")
+    accepted_oxygen_folder = os.path.join(output_folder, "accepted_tio2_pool")
+    os.makedirs(ti_folder, exist_ok=True)
+    os.makedirs(oxygen_folder, exist_ok=True)
+    os.makedirs(accepted_oxygen_folder, exist_ok=True)
+
+    oxygen_cache_csv = os.path.join(output_folder, "oxygen_training_environment_statistics.csv")
+    oxygen_cache_meta = os.path.join(output_folder, "oxygen_training_environment_statistics.meta.json")
+    to = time.perf_counter()
+    oxygen_training = OxygenTrainingDistribution(
+        canonical, num_wps, args.ti_o_cutoff, ncpu, oxygen_cache_csv, oxygen_cache_meta,
+        hashlib.sha1(f"{cache_key}:oxygen:{args.ti_o_cutoff}".encode()).hexdigest(),
+    )
+    timings["oxygen_chemistry_extraction_s"] = time.perf_counter() - to
+
+    ti_builder_config = {
+        "initializations": args.starts_per_template,
+        "screen_steps": args.builder_screen_steps,
+        "refine_starts": args.builder_refine_starts,
+        "refine_steps": args.builder_refine_steps,
+        "cn_tolerance": args.cn_tolerance,
+        "minimum_distance": args.minimum_ti_ti_distance,
+        "maximum_loss": args.maximum_total_loss,
+        "chemistry_cutoff": args.chemistry_cutoff,
+        "max_ti_atoms": args.max_ti_atoms,
+        "max_neighbors": args.max_ti_neighbors,
+        "lr": args.builder_lr,
+        "seed": global_seed,
+    }
+    o_builder_config = {
+        "initializations": args.o_starts_per_template,
+        "screen_steps": args.o_builder_screen_steps,
+        "refine_starts": args.o_builder_refine_starts,
+        "refine_steps": args.o_builder_refine_steps,
+        "ti_cn_tolerance": args.o_ti_cn_tolerance,
+        "o_cn_tolerance": args.o_o_cn_tolerance,
+        "distance_tolerance": args.o_distance_tolerance,
+        "minimum_ti_o": args.minimum_ti_o_distance,
+        "minimum_o_o": args.minimum_o_o_distance,
+        "maximum_loss": args.o_maximum_total_loss,
+        "max_neighbors": args.o_max_neighbors,
+        "lr": args.o_builder_lr,
+        "seed": global_seed,
+    }
+
+    workers = max(1, int(ngpu) if int(ngpu) > 0 else 1)
+    max_in_flight = max(1, int(args.gpu_queue_depth) * workers)
+    desired_o_parents = int(args.active_o_parents) if args.active_o_parents > 0 else 2 * workers
+    ti_in_flight_target = max(1, min(max_in_flight - 1, int(round(max_in_flight * args.ti_task_fraction)))) if max_in_flight > 1 else 1
+    min_generation_target = max(args.sample, int(math.ceil(args.sample * (1.0 + args.min_sample_overhead))))
+    max_generation_target = max(min_generation_target, int(math.ceil(args.sample * (1.0 + args.max_sample_overhead))))
+    ranking_check_interval = max(1, int(math.ceil(args.sample * args.ranking_check_fraction)))
+    print(
+        "Streaming Phase A/B: "
+        f"target_complete={args.sample}, gpu_workers={workers}, "
+        f"max_in_flight={max_in_flight}, desired_active_o_parents={desired_o_parents}, "
+        f"Ti/O_slot_target={ti_in_flight_target}/{max_in_flight - ti_in_flight_target}, "
+        f"accepted_pool_range={min_generation_target}-{max_generation_target}",
+        flush=True,
+    )
+
+    pool = StreamingBuilderPool(ngpu, ti_builder_config, o_builder_config, max_in_flight)
+    tg = time.perf_counter()
+
+    active_ti, active_o = {}, {}
+    ti_rr, o_rr = deque(), deque()
+    final_rows, final_diag = [], []
+    ti_rows, ti_diag, ti_attempt_diag = [], [], []
+    o_attempt_diag = []
+
+    next_ti_target_id = 0
+    next_o_target_id = 0
+    next_task_id = 0
+    ti_template_attempts = 0
+    o_template_attempts = 0
+    outstanding_total = 0
+    outstanding_ti = 0
+    outstanding_o = 0
+    ti_targets_considered = 0
+    ti_targets_exhausted = 0
+    ti_frameworks_accepted = 0
+    ti_frameworks_sent_to_o = 0
+    o_targets_exhausted = 0
+    ti_source_attempts = {"interpolation": 0, "exploration": 0}
+    ti_source_selected = {"interpolation": 0, "exploration": 0}
+    o_source_attempts = {"interpolation": 0, "exploration": 0}
+    o_source_selected = {"interpolation": 0, "exploration": 0}
+    ti_accepted_cycles = {}
+    o_accepted_cycles = {}
+    worker_tasks = {}
+    termination_reason = None
+    ranking_checks = []
+    previous_top_ids = None
+    previous_boundary_score = None
+    stable_ranking_checks = 0
+    ranking_converged = False
+    next_ranking_check = int(args.sample)
+
+    def progress(prefix="Progress"):
+        print(
+            f"{prefix}: accepted_pool={len(final_rows)}; final_target={args.sample}; "
+            f"Ti_frameworks={ti_frameworks_accepted}; O_exhausted={o_targets_exhausted}; "
+            f"active_Ti/O={len(active_ti)}/{len(active_o)}; "
+            f"in_flight_Ti/O={outstanding_ti}/{outstanding_o}; "
+            f"Ti/O_attempts={ti_template_attempts}/{o_template_attempts}",
+            flush=True,
+        )
+
+    def prepare_ti_cycle(state):
+        state.cycle_pool = list(state.elites)
+        state.proposals = []
+        state.submitted = 0
+        state.returned = 0
+        needed = max(0, args.search_population - len(state.elites))
+        proposals, rounds = [], 0
+        while len(proposals) < needed and ti_template_attempts + len(proposals) < args.max_global_attempts:
+            rounds += 1
+            batch, stats = draw_proposals(
+                model, args.sw_mode, needed - len(proposals), rng,
+                args.temperature, composition, num_wps, args.max_ti_atoms,
+            )
+            for spg, token, source in batch:
+                h = proposal_hash(spg, token)
+                if h in state.attempted:
+                    continue
+                state.attempted.add(h)
+                proposals.append((spg, token, source))
+                if len(proposals) >= needed:
+                    break
+            if not batch or rounds >= 20:
+                break
+        state.proposals = proposals
+
+    def add_ti_target():
+        nonlocal next_ti_target_id, ti_targets_considered
+        state = StreamingTiState(next_ti_target_id, training.sample_any(rng))
+        active_ti[state.target_id] = state
+        ti_rr.append(state.target_id)
+        next_ti_target_id += 1
+        ti_targets_considered += 1
+        prepare_ti_cycle(state)
+        return state
+
+    def ti_needs_parents():
+        return (len(final_rows) < max_generation_target and not ranking_converged and
+                (len(active_o) + len(active_ti)) < desired_o_parents and
+                ti_template_attempts < args.max_global_attempts)
+
+    def ensure_ti_parent_capacity():
+        while ti_needs_parents():
+            add_ti_target()
+
+    def submit_next_ti_task():
+        nonlocal next_task_id, ti_template_attempts, outstanding_total, outstanding_ti
+        if not active_ti:
+            return False
+        for _ in range(len(ti_rr)):
+            tid = ti_rr.popleft()
+            state = active_ti.get(tid)
+            if state is None:
+                continue
+            ti_rr.append(tid)
+            if state.submitted >= len(state.proposals):
+                continue
+            if ti_template_attempts >= args.max_global_attempts:
+                return False
+            slot = state.submitted
+            spg, token, source = state.proposals[slot]
+            state.submitted += 1
+            ti_template_attempts += 1
+            next_task_id += 1
+            outstanding_total += 1
+            outstanding_ti += 1
+            ti_source_attempts[source] = ti_source_attempts.get(source, 0) + 1
+            pool.submit({
+                "stage": "ti", "task_id": next_task_id, "target_id": state.target_id,
+                "cycle": state.cycle, "proposal_slot": slot,
+                "spg": spg, "token": token, "proposal_source": source,
+                "target": state.target,
+                "seed": deterministic_seed(global_seed, state.target_id, state.cycle, slot),
+            })
+            return True
+        return False
+
+    def prepare_o_cycle(state):
+        state.cycle_pool = []
+        state.proposals = []
+        state.submitted = 0
+        state.returned = 0
+        state.no_legal_proposals = False
+        max_sites = num_wps - len(state.framework["ti_wps"])
+        if max_sites <= 0:
+            state.no_legal_proposals = True
+            return
+        required = 2 * len(state.framework["ti_frac"])
+        learned = oxygen_training.learned_tokens(state.framework["spg"], required, max_sites)
+        proposals, rounds = [], 0
+        while len(proposals) < args.o_search_population and o_template_attempts + len(proposals) < args.o_max_global_attempts:
+            rounds += 1
+            batch = sample_legal_o_skeletons(
+                state.framework["spg"], required, args.o_search_population - len(proposals),
+                max_sites, rng, learned, args.o_sw_mode,
+            )
+            for token, source in batch:
+                if token in state.attempted:
+                    continue
+                state.attempted.add(token)
+                proposals.append((token, source))
+                if len(proposals) >= args.o_search_population:
+                    break
+            if not batch or rounds >= 20:
+                break
+        state.proposals = proposals
+        if not proposals:
+            state.no_legal_proposals = True
+
+    def add_o_target(framework):
+        nonlocal next_o_target_id, ti_frameworks_sent_to_o
+        state = StreamingOState(
+            target_id=next_o_target_id,
+            phase_a_sample_id=int(framework.get("phase_a_sample_id", next_o_target_id)),
+            framework=framework,
+            target=oxygen_training.sample_for_framework(framework, rng, args.o_target_nearest),
+        )
+        active_o[state.target_id] = state
+        o_rr.append(state.target_id)
+        next_o_target_id += 1
+        ti_frameworks_sent_to_o += 1
+        prepare_o_cycle(state)
+        return state
+
+    def submit_next_o_task():
+        nonlocal next_task_id, o_template_attempts, outstanding_total, outstanding_o
+        if not active_o:
+            return False
+        for _ in range(len(o_rr)):
+            oid = o_rr.popleft()
+            state = active_o.get(oid)
+            if state is None:
+                continue
+            o_rr.append(oid)
+            if state.submitted >= len(state.proposals):
+                continue
+            if o_template_attempts >= args.o_max_global_attempts:
+                return False
+            slot = state.submitted
+            token, source = state.proposals[slot]
+            state.submitted += 1
+            o_template_attempts += 1
+            next_task_id += 1
+            outstanding_total += 1
+            outstanding_o += 1
+            o_source_attempts[source] = o_source_attempts.get(source, 0) + 1
+            pool.submit({
+                "stage": "oxygen", "task_id": next_task_id, "target_id": state.target_id,
+                "cycle": state.cycle, "proposal_slot": slot,
+                "token": token, "proposal_source": source,
+                "framework": state.framework, "target": state.target,
+                "seed": deterministic_seed(global_seed + 100003, state.target_id, state.cycle, slot),
+            })
+            return True
+        return False
+
+    def accept_ti_state(state, solved):
+        nonlocal ti_frameworks_accepted
+        row = build_output_row(solved, solved["spg"], solved["token"], num_wps, n_ti_max)
+        ti_rows.append(row)
+        diag = {k: v for k, v in solved.items() if k not in {"lattice", "free", "frac", "generators", "cell"}}
+        diag.update({
+            "target_id": state.target_id,
+            "phase_a_sample_id": ti_frameworks_accepted,
+            "spg": solved["spg"], "ti_skeleton_token": solved["token"],
+            "target_source_group": state.target.source_group,
+            "target_ti_cn": state.target.target_ti_cn,
+            "target_ti_nn_mean": state.target.target_ti_nn_mean,
+            "target_ti_nn_width": state.target.target_ti_nn_width,
+            "target_ti_shell_cutoff": state.target.target_ti_shell_cutoff,
+            "target_ti_sphere_radius": state.target.target_ti_sphere_radius,
+            "sw_mode": solved["proposal_source"], "proposal_source": solved["proposal_source"],
+        })
+        ti_diag.append(diag)
+        save_ti_cif(solved, os.path.join(ti_folder, f"sample_{ti_frameworks_accepted:06d}.cif"))
+        ti_source_selected[solved["proposal_source"]] = ti_source_selected.get(solved["proposal_source"], 0) + 1
+        ti_accepted_cycles[state.cycle + 1] = ti_accepted_cycles.get(state.cycle + 1, 0) + 1
+        framework = phase_a_row_to_framework(row, diag, num_wps)
+        framework["phase_a_sample_id"] = ti_frameworks_accepted
+        ti_frameworks_accepted += 1
+        active_ti.pop(state.target_id, None)
+        add_o_target(framework)
+
+    def resolve_ti_state_if_ready(state):
+        nonlocal ti_targets_exhausted
+        if state.submitted < len(state.proposals) or state.returned < state.submitted:
+            return False
+        valid = [x for x in state.cycle_pool if x.get("chemistry_success", False)]
+        if valid:
+            valid.sort(key=lambda x: float(x.get("total_loss", 1e9)))
+            accept_ti_state(state, valid[0])
+            return True
+        state.cycle_pool.sort(key=lambda x: candidate_score(x, state.target))
+        state.elites = state.cycle_pool[:args.search_elites]
+        if state.cycle + 1 >= args.search_cycles or ti_template_attempts >= args.max_global_attempts or not state.proposals:
+            ti_targets_exhausted += 1
+            active_ti.pop(state.target_id, None)
+            try:
+                ti_rr.remove(state.target_id)
+            except ValueError:
+                pass
+            if ti_targets_exhausted == 1 or ti_targets_exhausted % args.progress_every == 0:
+                progress(prefix=f"Phase A exhausted={ti_targets_exhausted}")
+            return True
+        state.cycle += 1
+        prepare_ti_cycle(state)
+        return True
+
+    def accept_o_state(state, solved):
+        row = build_complete_output_row(state.framework, solved, solved["token"], num_wps)
+        final_rows.append(row)
+        diag = {k: v for k, v in solved.items() if k not in {"o_free", "o_frac"}}
+        diag.update({
+            "target_id": state.target_id,
+            "phase_a_sample_id": state.phase_a_sample_id,
+            "spg": state.framework["spg"],
+            "o_skeleton_token": solved["token"],
+            "proposal_source": solved["proposal_source"],
+            "target_source_group": state.target.source_group,
+            "target_ti_o_cn": state.target.target_ti_o_cn,
+            "target_ti_o_cn_std": state.target.target_ti_o_cn_std,
+            "target_o_ti_cn": state.target.target_o_ti_cn,
+            "target_o_ti_cn_std": state.target.target_o_ti_cn_std,
+            "target_ti_o_mean": state.target.target_ti_o_mean,
+            "target_ti_o_width": state.target.target_ti_o_width,
+        })
+        for i, value in enumerate(state.target.oti_o_angle_profile):
+            diag[f"target_angle_bin_{i}"] = float(value)
+        for i, value in enumerate(state.target.shell_o_o_profile):
+            diag[f"target_shell_o_o_bin_{i}"] = float(value)
+        candidate_id = len(final_rows) - 1
+        ranking_score = float(solved.get("total_loss", 1e9))
+        diag["candidate_id"] = int(candidate_id)
+        diag["ranking_score"] = ranking_score
+        final_diag.append(diag)
+        save_tio2_cif(
+            state.framework, solved,
+            os.path.join(accepted_oxygen_folder, f"candidate_{candidate_id:06d}.cif"),
+        )
+        o_source_selected[solved["proposal_source"]] = o_source_selected.get(solved["proposal_source"], 0) + 1
+        o_accepted_cycles[state.cycle + 1] = o_accepted_cycles.get(state.cycle + 1, 0) + 1
+        active_o.pop(state.target_id, None)
+        try:
+            o_rr.remove(state.target_id)
+        except ValueError:
+            pass
+        if len(final_rows) == 1 or len(final_rows) % args.progress_every == 0:
+            progress(prefix="Streaming progress")
+        update_ranking_convergence()
+
+    def update_ranking_convergence():
+        nonlocal previous_top_ids, previous_boundary_score
+        nonlocal stable_ranking_checks, ranking_converged, next_ranking_check, termination_reason
+        accepted = len(final_rows)
+        if accepted < args.sample or accepted < next_ranking_check:
+            return
+        ranked_idx = sorted(range(accepted), key=lambda i: float(final_diag[i].get("ranking_score", 1e9)))
+        top_idx = ranked_idx[:args.sample]
+        lo = max(0, int(math.floor(0.95 * args.sample)))
+        boundary_scores = [float(final_diag[i].get("ranking_score", 1e9)) for i in top_idx[lo:args.sample]]
+        boundary_score = float(np.median(boundary_scores)) if boundary_scores else float("inf")
+        top_ids = {int(final_diag[i]["candidate_id"]) for i in top_idx}
+        boundary_change = None
+        turnover = None
+        stable_now = False
+        if previous_boundary_score is not None and previous_top_ids is not None:
+            boundary_change = abs(boundary_score - previous_boundary_score) / max(abs(previous_boundary_score), 1e-12)
+            turnover = 1.0 - len(top_ids & previous_top_ids) / max(args.sample, 1)
+            stable_now = (
+                accepted >= min_generation_target
+                and boundary_change <= args.ranking_boundary_tol
+                and turnover <= args.ranking_turnover_tol
+            )
+            stable_ranking_checks = stable_ranking_checks + 1 if stable_now else 0
+        record = {
+            "accepted_pool": int(accepted),
+            "boundary_score": boundary_score,
+            "boundary_change": boundary_change,
+            "top_n_turnover": turnover,
+            "stable_now": bool(stable_now),
+            "stable_count": int(stable_ranking_checks),
+        }
+        ranking_checks.append(record)
+        if accepted >= min_generation_target:
+            bc = "baseline" if boundary_change is None else f"{100.0 * boundary_change:.3f}%"
+            tv = "baseline" if turnover is None else f"{100.0 * turnover:.3f}%"
+            print(
+                f"Ranking check @ {accepted}: boundary={boundary_score:.6f}; "
+                f"change={bc}; top{args.sample}_turnover={tv}; "
+                f"stable={stable_ranking_checks}/{args.ranking_stable_checks}",
+                flush=True,
+            )
+        previous_boundary_score = boundary_score
+        previous_top_ids = top_ids
+        next_ranking_check = accepted + ranking_check_interval
+        if stable_ranking_checks >= args.ranking_stable_checks:
+            ranking_converged = True
+            termination_reason = "ranking_converged"
+            print(
+                f"Ranking converged with {accepted} accepted complete TiO2 candidates; "
+                f"final selection will retain best {args.sample}.",
+                flush=True,
+            )
+
+    def resolve_o_state_if_ready(state):
+        nonlocal o_targets_exhausted
+        if state.submitted < len(state.proposals) or state.returned < state.submitted:
+            return False
+        valid = [x for x in state.cycle_pool if x.get("chemistry_success", False)]
+        if valid:
+            valid.sort(key=lambda x: oxygen_candidate_score(x, state.target))
+            accept_o_state(state, valid[0])
+            return True
+        if (state.cycle + 1 >= args.o_search_cycles or o_template_attempts >= args.o_max_global_attempts or
+                state.no_legal_proposals):
+            o_targets_exhausted += 1
+            active_o.pop(state.target_id, None)
+            try:
+                o_rr.remove(state.target_id)
+            except ValueError:
+                pass
+            if o_targets_exhausted == 1 or o_targets_exhausted % args.progress_every == 0:
+                progress(prefix=f"Phase B exhausted={o_targets_exhausted}")
+            return True
+        state.cycle += 1
+        prepare_o_cycle(state)
+        return True
+
+    def resolve_ready_states():
+        changed = True
+        while changed:
+            changed = False
+            for state in list(active_o.values()):
+                changed = resolve_o_state_if_ready(state) or changed
+            for state in list(active_ti.values()):
+                changed = resolve_ti_state_if_ready(state) or changed
+
+    def submit_bounded_work():
+        submitted_any = False
+        ensure_ti_parent_capacity()
+        while outstanding_total < max_in_flight and not ranking_converged and len(final_rows) < max_generation_target:
+            ensure_ti_parent_capacity()
+            if not active_o:
+                if submit_next_ti_task():
+                    submitted_any = True
+                    continue
+                if submit_next_o_task():
+                    submitted_any = True
+                    continue
+                break
+            if outstanding_ti < ti_in_flight_target and submit_next_ti_task():
+                submitted_any = True
+                continue
+            if submit_next_o_task():
+                submitted_any = True
+                continue
+            if submit_next_ti_task():
+                submitted_any = True
+                continue
+            break
+        return submitted_any
+
+    try:
+        while len(final_rows) < max_generation_target and not ranking_converged:
+            resolve_ready_states()
+            update_ranking_convergence()
+            submit_bounded_work()
+            if ranking_converged or len(final_rows) >= max_generation_target:
+                if termination_reason is None:
+                    termination_reason = "maximum_sample_overhead_reached"
+                break
+            if outstanding_total <= 0:
+                resolve_ready_states()
+                submit_bounded_work()
+                if outstanding_total <= 0:
+                    if ti_template_attempts >= args.max_global_attempts:
+                        termination_reason = "ti_template_attempt_limit_reached"
+                    elif o_template_attempts >= args.o_max_global_attempts:
+                        termination_reason = "oxygen_template_attempt_limit_reached"
+                    else:
+                        termination_reason = "streaming_scheduler_no_submittable_work"
+                    break
+            result = pool.get()
+            outstanding_total -= 1
+            worker_id = int(result["worker_id"])
+            worker_tasks[worker_id] = worker_tasks.get(worker_id, 0) + 1
+            if result["stage"] == "ti":
+                outstanding_ti -= 1
+                state = active_ti.get(int(result["target_id"]))
+                if state is None:
+                    continue
+                state.returned += 1
+                for item in result["attempts"]:
+                    row = {k: v for k, v in item.items() if k not in {"lattice", "free", "frac", "generators", "cell"}}
+                    row.update({
+                        "target_id": state.target_id, "cycle": state.cycle,
+                        "spg": result.get("spg"), "ti_skeleton_token": result.get("token"),
+                        "sw_mode": result.get("proposal_source"),
+                        "proposal_source": result.get("proposal_source"),
+                        "target_ti_cn": state.target.target_ti_cn,
+                        "target_source_group": state.target.source_group,
+                        "worker_id": worker_id, "worker_error": result.get("error"),
+                    })
+                    ti_attempt_diag.append(row)
+                selected = result.get("selected")
+                if selected is not None:
+                    selected = selected.copy()
+                    selected.update({
+                        "spg": result["spg"], "token": result["token"],
+                        "sw_mode": result["proposal_source"],
+                        "proposal_source": result["proposal_source"],
+                        "cycle": state.cycle, "worker_id": worker_id,
+                    })
+                    state.cycle_pool.append(selected)
+                resolve_ti_state_if_ready(state)
+            elif result["stage"] == "oxygen":
+                outstanding_o -= 1
+                state = active_o.get(int(result["target_id"]))
+                if state is None:
+                    continue
+                state.returned += 1
+                for item in result["attempts"]:
+                    row = {k: v for k, v in item.items() if k not in {"o_free", "o_frac"}}
+                    row.update({
+                        "target_id": state.target_id, "phase_a_sample_id": state.phase_a_sample_id,
+                        "cycle": state.cycle, "spg": state.framework["spg"],
+                        "o_skeleton_token": result.get("token"),
+                        "proposal_source": result.get("proposal_source"),
+                        "worker_id": worker_id, "worker_error": result.get("error"),
+                        "target_ti_o_cn": state.target.target_ti_o_cn,
+                        "target_o_ti_cn": state.target.target_o_ti_cn,
+                        "target_ti_o_mean": state.target.target_ti_o_mean,
+                        "target_source_group": state.target.source_group,
+                    })
+                    o_attempt_diag.append(row)
+                selected = result.get("selected")
+                if selected is not None:
+                    selected = selected.copy()
+                    selected.update({
+                        "token": result["token"], "proposal_source": result["proposal_source"],
+                        "cycle": state.cycle, "worker_id": worker_id,
+                    })
+                    state.cycle_pool.append(selected)
+                resolve_o_state_if_ready(state)
+    finally:
+        pool.close()
+
+    timings["streaming_generation_s"] = time.perf_counter() - tg
+    # Write diagnostics even if the final exact-count assertion fails.
+    pd.DataFrame(ti_attempt_diag).to_csv(os.path.join(output_folder, "ti_builder_attempts.csv"), index=False)
+    pd.DataFrame(ti_diag).to_csv(os.path.join(output_folder, "ti_builder_selected.csv"), index=False)
+    pd.DataFrame(o_attempt_diag).to_csv(os.path.join(output_folder, "oxygen_builder_attempts.csv"), index=False)
+    if ti_rows:
+        ti_frame = pd.DataFrame(ti_rows)
+        for column in canonical.columns:
+            if column not in ti_frame.columns:
+                ti_frame[column] = np.nan
+        ti_frame = ti_frame[[c for c in canonical.columns if c in ti_frame.columns]]
+        ti_frame.to_csv(os.path.join(output_folder, f"{data_name}-streamed-phaseA-ti-{len(ti_frame)}.csv"), index=False)
+
+    if len(final_rows) < args.sample:
+        under = {
+            "requested_complete_tio2": int(args.sample),
+            "accepted_complete_tio2_pool": int(len(final_rows)),
+            "missing": int(args.sample - len(final_rows)),
+            "ti_targets_considered": int(ti_targets_considered),
+            "ti_targets_exhausted": int(ti_targets_exhausted),
+            "ti_frameworks_accepted": int(ti_frameworks_accepted),
+            "ti_frameworks_sent_to_oxygen": int(ti_frameworks_sent_to_o),
+            "oxygen_targets_exhausted": int(o_targets_exhausted),
+            "active_ti_targets": int(len(active_ti)),
+            "active_o_targets": int(len(active_o)),
+            "outstanding_ti_tasks": int(outstanding_ti),
+            "outstanding_o_tasks": int(outstanding_o),
+            "ti_template_attempts": int(ti_template_attempts),
+            "max_ti_template_attempts": int(args.max_global_attempts),
+            "oxygen_template_attempts": int(o_template_attempts),
+            "max_oxygen_template_attempts": int(args.o_max_global_attempts),
+            "max_in_flight_gpu_tasks": int(max_in_flight),
+            "desired_active_o_parents": int(desired_o_parents),
+            "reason": termination_reason or "streaming_generation_underfilled",
+        }
+        path = os.path.join(output_folder, "streaming_underfill.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(under, handle, indent=2)
+        raise RuntimeError(
+            f"Streaming Phase-A/B underfilled complete TiO2 pool: {len(final_rows)}/{args.sample}; "
+            f"diagnostics={path}"
+        )
+
+    ranked_indices = sorted(
+        range(len(final_rows)),
+        key=lambda i: float(final_diag[i].get("ranking_score", 1e9)),
+    )
+    selected_indices = ranked_indices[:args.sample]
+    selected_rows = [final_rows[i] for i in selected_indices]
+    selected_diag = [dict(final_diag[i], final_rank=rank + 1) for rank, i in enumerate(selected_indices)]
+
+    pd.DataFrame(final_diag).to_csv(os.path.join(output_folder, "oxygen_builder_accepted_pool.csv"), index=False)
+    pd.DataFrame(selected_diag).to_csv(os.path.join(output_folder, "oxygen_builder_selected.csv"), index=False)
+    pd.DataFrame(ranking_checks).to_csv(os.path.join(output_folder, "ranking_convergence.csv"), index=False)
+    pre_relaxation_metrics = evaluate_pre_relaxation(
+        final_rows, final_diag, selected_indices, num_wps, oxygen_training, output_folder, args.ti_o_cutoff
+    )
+
+    for old in Path(oxygen_folder).glob("sample_*.cif"):
+        old.unlink()
+    for rank, pool_index in enumerate(selected_indices):
+        candidate_id = int(final_diag[pool_index]["candidate_id"])
+        shutil.copy2(
+            os.path.join(accepted_oxygen_folder, f"candidate_{candidate_id:06d}.cif"),
+            os.path.join(oxygen_folder, f"sample_{rank:06d}.cif"),
+        )
+
+    final = pd.DataFrame(selected_rows)
+    for column in canonical.columns:
+        if column not in final.columns:
+            final[column] = np.nan
+    final = final[[c for c in canonical.columns if c in final.columns]]
+    final_path = os.path.join(output_folder, f"{data_name}-phaseB-tio2-{len(final)}.csv")
+    final.to_csv(final_path, index=False)
+    summary = {
+        "requested_complete_tio2": int(args.sample),
+        "accepted_complete_tio2_pool": int(len(final_rows)),
+        "selected_complete_tio2": int(len(selected_rows)),
+        "discarded_by_final_ranking": int(len(final_rows) - len(selected_rows)),
+        "pre_relaxation_metrics": pre_relaxation_metrics,
+        "ti_targets_considered": int(ti_targets_considered),
+        "ti_targets_exhausted": int(ti_targets_exhausted),
+        "ti_frameworks_accepted": int(ti_frameworks_accepted),
+        "ti_frameworks_sent_to_oxygen": int(ti_frameworks_sent_to_o),
+        "oxygen_targets_exhausted": int(o_targets_exhausted),
+        "ti_template_attempts": int(ti_template_attempts),
+        "oxygen_template_attempts": int(o_template_attempts),
+        "ti_framework_to_tio2_conversion": len(final_rows) / max(ti_frameworks_sent_to_o, 1),
+        "ti_template_acceptance_fraction": ti_frameworks_accepted / max(ti_template_attempts, 1),
+        "oxygen_template_acceptance_fraction": len(final_rows) / max(o_template_attempts, 1),
+        "ngpu": int(ngpu),
+        "gpu_workers": int(pool.workers),
+        "ncpu": int(ncpu),
+        "gpu_queue_depth": int(args.gpu_queue_depth),
+        "max_in_flight_gpu_tasks": int(max_in_flight),
+        "desired_active_o_parents": int(desired_o_parents),
+        "ti_task_fraction": float(args.ti_task_fraction),
+        "ti_in_flight_target": int(ti_in_flight_target),
+        "min_sample_overhead": float(args.min_sample_overhead),
+        "max_sample_overhead": float(args.max_sample_overhead),
+        "minimum_generation_target": int(min_generation_target),
+        "maximum_generation_target": int(max_generation_target),
+        "ranking_check_fraction": float(args.ranking_check_fraction),
+        "ranking_boundary_tolerance": float(args.ranking_boundary_tol),
+        "ranking_turnover_tolerance": float(args.ranking_turnover_tol),
+        "ranking_stable_checks_required": int(args.ranking_stable_checks),
+        "ranking_stable_checks_reached": int(stable_ranking_checks),
+        "generation_termination_reason": termination_reason or "maximum_sample_overhead_reached",
+        "ranking_checks": ranking_checks,
+        "worker_template_tasks": worker_tasks,
+        "ti_proposal_source_attempts": ti_source_attempts,
+        "ti_proposal_source_selected": ti_source_selected,
+        "oxygen_proposal_source_attempts": o_source_attempts,
+        "oxygen_proposal_source_selected": o_source_selected,
+        "ti_accepted_by_cycle": ti_accepted_cycles,
+        "oxygen_accepted_by_cycle": o_accepted_cycles,
+        "parallelization": "bounded streaming Phase-A to Phase-B with one shared persistent worker per GPU",
+        "scheduling": "bounded weighted-fair Ti/O submission with round-robin oxygen parents and adaptive ranking convergence",
+        "timings_seconds": timings,
+    }
+    with open(os.path.join(output_folder, "streaming_phaseAB_summary.json"), "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    return final_path, oxygen_folder, summary
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Wyckoff-parameterized factorized VAE for TiO2 LEGO-Xtal data"
-    )
+    parser = argparse.ArgumentParser(description="Streaming Ti/O generation-swap builder v18")
     parser.add_argument("--data", required=True)
     parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--nbatch", type=int, default=500)
+    parser.add_argument("--sample", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--cutoff", type=int, default=None)
-    parser.add_argument("--sample", type=int, default=100000)
+    parser.add_argument("--cutoff", type=int)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument(
-        "--composition",
-        default="1,2",
-        help=(
-            "Center:sublattice stoichiometric coefficients used by the "
-            "Wyckoff multiplicity masks (default: 1,2 for TiO2)."
-        ),
-    )
+    parser.add_argument("--composition", default="1,2")
     parser.add_argument("--context-end", type=float, default=0.8)
-    parser.add_argument("--selection-block-size", type=int, default=64,
-        help="Candidates committed per adaptive selector update.")
-    parser.add_argument("--selection-min-score", type=float, default=0.0,
-        help=argparse.SUPPRESS)
-    parser.add_argument("--nn-bins", type=int, default=40,
-        help="Histogram bins for per-Ti periodic nearest-neighbour distances.")
-    parser.add_argument("--nn-oversample-factor", type=float, default=1.0,
-        help=argparse.SUPPRESS)
-    parser.add_argument("--nn-round-size", type=int, default=2000,
-        help="Maximum number of candidates generated in one online-selection round.")
-    parser.add_argument("--nn-overfill-penalty", type=float, default=1.0)
-    parser.add_argument("--nn-selection-temperature", type=float, default=0.01)
-    parser.add_argument("--si-min-terminal", type=float, default=2.20,
-        help="Broad zero-probability Ti-Ti safety floor in angstrom.")
-    parser.add_argument("--nn-target-sigma-scale", type=float, default=1.0,
-        help="Multiply the measured training per-Ti NN standard deviation by this factor.")
-    parser.add_argument("--nn-histogram-sigma-span", type=float, default=4.0,
-        help="Minimum histogram span on each side of the Gaussian mean, in target sigma.")
-    parser.add_argument("--gpu-contact-batch", type=int, default=128)
-    parser.add_argument("--gpu-shift-chunk", type=int, default=27)
-    parser.add_argument("--gpu-geometry-memory-gib", type=float, default=0.75,
-        help="Approximate additional GPU-memory ceiling for NN screening.")
-    parser.add_argument("--min-terminal-round-size", type=int, default=1000)
-    parser.add_argument("--max-sample-rounds", type=int, default=100)
-    parser.add_argument("--nn-image-range", type=int, default=1,
-        help="Periodic translation range used for exact per-Ti nearest neighbours.")
-    parser.add_argument("--geometry-workers", type=int, default=3,
-        help="CPU worker processes for symmetry expansion; 0 or 1 keeps serial behavior.")
-    parser.add_argument("--o-shell-bins", type=int, default=40)
-    parser.add_argument("--o-sequential-beam-width", type=int, default=6,
-        help="Beam width for sequential independent-O-site construction.")
-    parser.add_argument("--o-sequential-candidates-per-site", type=int, default=32,
-        help="Cached Wyckoff orbit candidates retained per beam state and O site.")
-    parser.add_argument("--o-sequential-skeletons", type=int, default=2,
-        help="Distinct O skeletons sampled from the conditional decoder per fixed Si.")
-    parser.add_argument("--o-sequential-oo-min", type=float, default=1.20,
-        help="Catastrophic O-O distance floor used only as an exclusion constraint.")
-    parser.add_argument("--o-sequential-sio-min", type=float, default=1.50,
-        help="Catastrophic Ti-O distance floor during constructive placement.")
-    parser.add_argument("--ionic-sio-sigma-scale", type=float, default=0.50,
-        help="Compress the pooled Ti-O training standard deviation by this factor.")
-    parser.add_argument("--ionic-oo-sigma-scale", type=float, default=0.50,
-        help="Compress the nearest O-O training standard deviation by this factor.")
-    parser.add_argument("--pool-fill-candidate-batch", type=int, default=1000,
-        help=(
-            "Minimum number of complete candidate frameworks targeted per round while "
-            "the output pool is still filling. This fixed additive workload prevents "
-            "sampling throughput from contracting with the number of remaining slots."
-        ))
-    parser.add_argument("--pool-candidate-batch", type=int, default=100,
-        help="Complete valid candidates evaluated per round after the output pool is full.")
-    parser.add_argument("--pool-weight-exponent", type=float, default=1.0,
-        help="Exponent applied to unresolved normalized distribution errors when adapting weights.")
-    parser.add_argument("--pool-weight-floor", type=float, default=0.10,
-        help="Minimum unresolved-error basis retained by every adaptive component weight.")
-    parser.add_argument("--pool-weight-smoothing", type=float, default=0.20,
-        help="Round-wise interpolation fraction toward newly inferred adaptive weights.")
-    parser.add_argument("--pool-guard-min-fraction", type=float, default=0.05,
-        help="Late-stage maximum relative degradation permitted for any distribution component.")
-    parser.add_argument("--pool-guard-max-fraction", type=float, default=0.20,
-        help="Early-stage maximum relative degradation permitted for any distribution component.")
-    parser.add_argument("--pool-guard-absolute-floor", type=float, default=0.002,
-        help="Absolute TV degradation allowance used when percentage guards become too small.")
-    parser.add_argument("--pool-replacement-relative-tolerance", type=float, default=1.0e-3,
-        help="Required replacement improvement as a fraction of current adaptive pool loss.")
-    parser.add_argument("--pool-replacement-absolute-floor", type=float, default=1.0e-5,
-        help="Absolute lower floor on required adaptive pool-loss improvement.")
-    parser.add_argument("--pool-convergence-window-sqrt-factor", type=float, default=50.0,
-        help="Convergence window scales as this factor times sqrt(pool capacity).")
-    parser.add_argument("--pool-convergence-window-min", type=int, default=500,
-        help="Minimum rolling convergence-window size in complete candidates.")
-    parser.add_argument("--pool-convergence-window-max", type=int, default=5000,
-        help="Maximum rolling convergence-window size in complete candidates.")
-    parser.add_argument("--pool-convergence-relative-gain", type=float, default=1.0e-2,
-        help="Good-enough maximum monitor-loss gain over a converged window. Default: 1 percent.")
-    parser.add_argument("--pool-convergence-max-swap-fraction", type=float, default=2.0e-3,
-        help="Maximum accepted-swap fraction allowed within a converged window.")
-    parser.add_argument("--pool-convergence-max-swaps-floor", type=int, default=2,
-        help="Minimum absolute swap allowance within a convergence window.")
-    parser.add_argument("--pool-minimum-postfill-multiplier", type=float, default=2.0,
-        help="Minimum post-fill budget as a multiple of the convergence window.")
-    parser.add_argument("--pool-minimum-postfill-capacity-fraction", type=float, default=0.10,
-        help="Additional minimum post-fill budget as a fraction of pool capacity.")
-    parser.add_argument("--pool-maximum-postfill-candidates", type=int, default=20000,
-        help="Unconditional hard cap on complete post-fill candidates.")
-    parser.add_argument("--pool-topology-weight", type=float, default=0.30,
-        help="Fixed weight of mean TiO6/OTi3 topology quality in pool replacement.")
-    parser.add_argument("--integrity-max-ti-o", type=float, default=2.6)
-    parser.add_argument("--integrity-max-o-ti", type=float, default=2.6)
-    parser.add_argument("--integrity-max-angle-rms", type=float, default=22.0)
-    parser.add_argument("--integrity-min-ti-pass-fraction", type=float, default=1.0)
-    parser.add_argument("--integrity-min-o-pass-fraction", type=float, default=1.0)
+    parser.add_argument("--sw-mode", choices=("interpolation", "exploration", "mixed"), default="mixed")
+    parser.add_argument(
+        "--ncpu", type=int, default=0,
+        help="CPU workers; 0 auto-detects the Slurm/cgroup allocation and reserves one CPU for scheduling.",
+    )
+    parser.add_argument(
+        "--ngpu", type=int, default=0,
+        help="GPU workers; 0 uses every CUDA device visible to this process.",
+    )
+    parser.add_argument(
+        "--gpu-queue-depth", type=int, default=2,
+        help="Maximum streaming GPU tasks in flight per GPU worker. Default keeps only O(NGPU) tasks submitted.",
+    )
+    parser.add_argument(
+        "--active-o-parents", type=int, default=0,
+        help="Target active Ti/O parent working set; 0 resolves to 2*NGPU.",
+    )
+    parser.add_argument(
+        "--ti-task-fraction", type=float, default=0.375,
+        help="Target fraction of bounded in-flight GPU tasks reserved for Ti while oxygen parents exist.",
+    )
+    parser.add_argument("--min-sample-overhead", type=float, default=0.10)
+    parser.add_argument("--max-sample-overhead", type=float, default=1.00)
+    parser.add_argument("--ranking-check-fraction", type=float, default=0.10)
+    parser.add_argument("--ranking-boundary-tol", type=float, default=0.01)
+    parser.add_argument("--ranking-turnover-tol", type=float, default=0.05)
+    parser.add_argument("--ranking-stable-checks", type=int, default=2)
+    parser.add_argument(
+        "--progress-every", type=int, default=10,
+        help="Print aggregate streaming progress every N complete TiO2 acceptances/exhaustions.",
+    )
+    parser.add_argument("--search-cycles", type=int, default=6)
+    parser.add_argument("--search-population", type=int, default=8)
+    parser.add_argument("--search-elites", type=int, default=2)
+    parser.add_argument("--starts-per-template", type=int, default=2)
+    parser.add_argument("--builder-screen-steps", type=int, default=15)
+    parser.add_argument("--builder-refine-starts", type=int, default=2)
+    parser.add_argument("--builder-refine-steps", type=int, default=50)
+    parser.add_argument("--builder-lr", type=float, default=0.06)
+    parser.add_argument("--cn-tolerance", type=float, default=0.75)
+    parser.add_argument("--minimum-ti-ti-distance", type=float, default=2.0)
+    parser.add_argument("--maximum-total-loss", type=float, default=5.0)
+    parser.add_argument("--max-ti-atoms", type=int, default=MAX_TI_ATOMS)
+    parser.add_argument("--chemistry-cutoff", type=float, default=CHEMISTRY_CUTOFF)
+    parser.add_argument("--max-ti-neighbors", type=int, default=MAX_TI_NEIGHBORS)
+    parser.add_argument("--max-global-attempts", type=int, default=10000)
+    parser.add_argument("--o-sw-mode", choices=("interpolation", "exploration", "mixed"), default="exploration")
+    parser.add_argument("--o-search-cycles", type=int, default=6)
+    parser.add_argument("--o-search-population", type=int, default=8)
+    parser.add_argument("--o-starts-per-template", type=int, default=4)
+    parser.add_argument("--o-builder-screen-steps", type=int, default=25)
+    parser.add_argument("--o-builder-refine-starts", type=int, default=2)
+    parser.add_argument("--o-builder-refine-steps", type=int, default=60)
+    parser.add_argument("--o-builder-lr", type=float, default=0.06)
+    parser.add_argument("--ti-o-cutoff", type=float, default=TIO_CUTOFF)
+    parser.add_argument("--o-ti-cn-tolerance", type=float, default=0.75)
+    parser.add_argument("--o-o-cn-tolerance", type=float, default=0.75)
+    parser.add_argument("--o-distance-tolerance", type=float, default=0.35)
+    parser.add_argument("--minimum-ti-o-distance", type=float, default=1.45)
+    parser.add_argument("--minimum-o-o-distance", type=float, default=1.60)
+    parser.add_argument("--o-maximum-total-loss", type=float, default=8.0)
+    parser.add_argument("--o-max-neighbors", type=int, default=12)
+    parser.add_argument("--o-target-nearest", type=int, default=64)
+    parser.add_argument("--o-max-global-attempts", type=int, default=20000)
+    parser.add_argument("--output-dir", default="data/sample")
     args = parser.parse_args()
 
-    try:
-        composition_ratio = tuple(
-            int(value.strip()) for value in str(args.composition).split(",")
-        )
-    except ValueError as exc:
-        raise ValueError(
-            "--composition must contain two positive integers, e.g. 1,2."
-        ) from exc
-    if len(composition_ratio) != 2 or any(value <= 0 for value in composition_ratio):
-        raise ValueError(
-            "--composition must contain exactly two positive integers, e.g. 1,2."
-        )
+    positive = [args.epochs, args.nbatch, args.sample, args.search_cycles, args.search_population,
+                args.search_elites, args.starts_per_template, args.builder_screen_steps,
+                args.builder_refine_starts, args.builder_refine_steps, args.max_global_attempts,
+                args.o_search_cycles, args.o_search_population, args.o_starts_per_template,
+                args.o_builder_screen_steps, args.o_builder_refine_starts, args.o_builder_refine_steps,
+                args.o_max_neighbors, args.o_target_nearest, args.o_max_global_attempts,
+                args.gpu_queue_depth, args.ranking_stable_checks]
+    if min(positive) <= 0:
+        raise ValueError("Positive integer arguments must be greater than zero.")
+    if args.search_elites >= args.search_population:
+        raise ValueError("--search-elites must be smaller than --search-population.")
+    if args.builder_refine_starts > args.starts_per_template:
+        raise ValueError("--builder-refine-starts cannot exceed --starts-per-template.")
+    if args.o_builder_refine_starts > args.o_starts_per_template:
+        raise ValueError("--o-builder-refine-starts cannot exceed --o-starts-per-template.")
+    if args.progress_every <= 0:
+        raise ValueError("--progress-every must be greater than zero.")
+    if args.active_o_parents < 0:
+        raise ValueError("--active-o-parents cannot be negative.")
+    if not (0.0 < args.ti_task_fraction < 1.0):
+        raise ValueError("--ti-task-fraction must be between 0 and 1.")
+    if args.min_sample_overhead < 0.0 or args.max_sample_overhead < args.min_sample_overhead:
+        raise ValueError("Require 0 <= --min-sample-overhead <= --max-sample-overhead.")
+    if args.ranking_check_fraction <= 0.0:
+        raise ValueError("--ranking-check-fraction must be greater than zero.")
+    if args.ranking_boundary_tol < 0.0 or args.ranking_turnover_tol < 0.0:
+        raise ValueError("Ranking convergence tolerances cannot be negative.")
 
-    if not os.path.isfile(args.data):
-        raise FileNotFoundError(args.data)
-    if args.epochs <= 0 or args.nbatch <= 0 or args.sample <= 0:
-        raise ValueError("--epochs, --nbatch, and --sample must be positive.")
-    if not 0.0 <= args.context_end <= 1.0:
-        raise ValueError("--context-end must lie in [0, 1].")
-    if args.selection_block_size <= 0:
-        raise ValueError("--selection-block-size must be positive.")
-    if args.nn_bins < 4 or args.nn_oversample_factor < 1:
-        raise ValueError("NN bins must be >=4 and oversample factor >=1.")
-    if args.nn_round_size <= 0 or args.max_sample_rounds <= 0:
-        raise ValueError("Round size and max sample rounds must be positive.")
-    if args.nn_image_range != 1:
-        raise ValueError(
-            "The exact periodic geometry uses 27 images; require --nn-image-range 1."
-        )
-    if args.geometry_workers < 0:
-        raise ValueError("--geometry-workers must be nonnegative.")
-    if args.o_shell_bins < 4:
-        raise ValueError("--o-shell-bins must be at least 4.")
-    if args.o_sequential_beam_width < 1 or args.o_sequential_candidates_per_site < 8:
-        raise ValueError("Sequential O beam width must be positive and candidates/site >= 8.")
-    if args.o_sequential_skeletons < 1:
-        raise ValueError("--o-sequential-skeletons must be positive.")
-    if args.o_sequential_oo_min <= 0 or args.o_sequential_sio_min <= 0:
-        raise ValueError("Sequential O distance floors must be positive.")
-    if args.ionic_sio_sigma_scale <= 0 or args.ionic_oo_sigma_scale <= 0:
-        raise ValueError("Ionic Gaussian sigma scales must be positive.")
-    if args.pool_fill_candidate_batch < 1:
-        raise ValueError("--pool-fill-candidate-batch must be positive.")
-    if args.pool_candidate_batch < 1:
-        raise ValueError("--pool-candidate-batch must be positive.")
-    if args.pool_weight_exponent < 0:
-        raise ValueError("--pool-weight-exponent must be non-negative.")
-    if not 0 < args.pool_weight_floor <= 1:
-        raise ValueError("--pool-weight-floor must be in (0, 1].")
-    if not 0 <= args.pool_weight_smoothing <= 1:
-        raise ValueError("--pool-weight-smoothing must be in [0, 1].")
-    if not 0 <= args.pool_guard_min_fraction <= args.pool_guard_max_fraction:
-        raise ValueError("Pool guard fractions must satisfy 0 <= min <= max.")
-    if args.pool_guard_absolute_floor < 0:
-        raise ValueError("--pool-guard-absolute-floor must be non-negative.")
-    if (args.pool_replacement_relative_tolerance < 0
-            or args.pool_replacement_absolute_floor < 0):
-        raise ValueError("Pool replacement tolerances must be non-negative.")
-    if args.pool_convergence_window_sqrt_factor <= 0:
-        raise ValueError("--pool-convergence-window-sqrt-factor must be positive.")
-    if args.pool_convergence_window_min < 1:
-        raise ValueError("--pool-convergence-window-min must be at least 1.")
-    if args.pool_convergence_window_max < args.pool_convergence_window_min:
-        raise ValueError("Pool convergence window max must be >= min.")
-    if args.pool_convergence_relative_gain < 0:
-        raise ValueError("--pool-convergence-relative-gain must be non-negative.")
-    if args.pool_convergence_max_swap_fraction < 0:
-        raise ValueError("--pool-convergence-max-swap-fraction must be non-negative.")
-    if args.pool_convergence_max_swaps_floor < 0:
-        raise ValueError("--pool-convergence-max-swaps-floor must be non-negative.")
-    if args.pool_minimum_postfill_multiplier <= 0:
-        raise ValueError("--pool-minimum-postfill-multiplier must be positive.")
-    if args.pool_minimum_postfill_capacity_fraction < 0:
-        raise ValueError("--pool-minimum-postfill-capacity-fraction must be non-negative.")
-    if args.pool_maximum_postfill_candidates < 1:
-        raise ValueError("--pool-maximum-postfill-candidates must be at least 1.")
-    if args.pool_topology_weight < 0:
-        raise ValueError("--pool-topology-weight must be non-negative.")
-    if min(args.integrity_max_ti_o, args.integrity_max_o_ti, args.integrity_max_angle_rms) <= 0:
-        raise ValueError("Integrity distance and angle thresholds must be positive.")
-    if not (0 <= args.integrity_min_ti_pass_fraction <= 1 and
-            0 <= args.integrity_min_o_pass_fraction <= 1):
-        raise ValueError("Integrity pass fractions must lie in [0, 1].")
-    if args.nn_overfill_penalty < 0 or args.nn_selection_temperature < 0:
-        raise ValueError("NN selection penalties must be nonnegative.")
-    if args.nn_target_sigma_scale <= 0 or args.nn_histogram_sigma_span <= 1:
-        raise ValueError("NN Gaussian width settings must be positive.")
-    if args.gpu_contact_batch < 1 or args.gpu_shift_chunk < 1:
-        raise ValueError("GPU chunk sizes must be positive.")
-    if not 0 < args.gpu_geometry_memory_gib <= 1.5:
-        raise ValueError("GPU geometry memory must lie in (0, 1.5] GiB.")
-    if args.min_terminal_round_size < 1:
-        raise ValueError("Minimum terminal round size must be positive.")
-    if args.si_min_terminal <= 0:
-        raise ValueError("--si-min-terminal must be positive.")
-
-
+    ncpu = resolve_ncpu(args.ncpu)
+    set_worker_thread_limits()
+    composition = parse_composition(args.composition)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+    timings = {}
+    t0 = time.perf_counter()
 
+    print(f"Loading training CSV: {args.data}", flush=True)
     df = pd.read_csv(args.data)
     df.columns = df.columns.astype(str).str.strip()
     if args.cutoff is not None:
-        df = df.iloc[: args.cutoff].copy()
-    if df.empty:
-        raise ValueError("Training data is empty.")
-
+        df = df.iloc[:args.cutoff].copy()
     num_wps = validate_layout(df)
-    canonical_df, n_si_max, n_o_max = canonicalize_species_order(df, num_wps)
-    global_df, si_df, o_df = build_factorized_blocks(
-        canonical_df, num_wps, n_si_max, n_o_max
-    )
-
-    # Treat the cell block as discrete only when every cell value in the
-    # complete dataset is integer encoded.  Inspecting only the first ``a``
-    # value can misclassify an ordinary continuous dataset when that lattice
-    # constant happens to lie close to an integer.
-    cell_columns = ["a", "b", "c", "alpha", "beta", "gamma"]
-    cell_values = global_df[cell_columns].to_numpy(dtype=float)
-    discrete_cell = bool(
-        np.all(np.isfinite(cell_values))
-        and np.max(np.abs(cell_values - np.rint(cell_values))) < 1.0e-6
-    )
-    # Free Wyckoff parameters are continuous in [0, 1); -1 marks padding.
-    discrete_coordinates = False
-
-    global_discrete = ["spg"]
-    if discrete_cell:
-        global_discrete += ["a", "b", "c", "alpha", "beta", "gamma"]
-    si_discrete = ["si_skeleton_token"]
-    o_discrete = ["o_skeleton_token"]
-    if discrete_coordinates:
-        si_discrete += [c for c in si_df.columns if c != "si_skeleton_token"]
-        o_discrete += [c for c in o_df.columns if c != "o_skeleton_token"]
-
-    data_name = os.path.splitext(os.path.basename(args.data))[0]
-    model_folder = os.path.join("models", data_name, "FactorizedVAE_tio2_v3_fixed_capacity_pool")
-    sample_folder = os.path.join("data", "sample")
+    canonical, n_ti_max, n_o_max = canonicalize_species_order(df, num_wps)
+    print(f"Canonicalized {len(canonical)} rows. Building factorized blocks...", flush=True)
+    global_df, ti_df, o_df = build_factorized_blocks(canonical, num_wps, n_ti_max, n_o_max)
+    timings["data_preparation_s"] = time.perf_counter() - t0
+    discrete_cell = bool(np.max(np.abs(
+        global_df[BASE_COLUMNS[1:]].to_numpy(float) -
+        np.rint(global_df[BASE_COLUMNS[1:]].to_numpy(float))
+    )) < 1e-6)
+    global_discrete = ["spg"] + (BASE_COLUMNS[1:] if discrete_cell else [])
+    data_name = Path(args.data).stem
+    model_folder = os.path.join("models", data_name, "FactorizedVAE_tio2_phaseAB_v18")
+    output_folder = os.path.join(args.output_dir, f"{data_name}-phaseAB-v18-seed{args.seed}")
     os.makedirs(model_folder, exist_ok=True)
-    os.makedirs(sample_folder, exist_ok=True)
+    os.makedirs(output_folder, exist_ok=True)
 
-    print(f"Rows: {len(df)}")
-    print(
-        "Chemistry roles: "
-        f"Ti target_coord={SI_CN}, O target_coord={O_CN}, "
-        f"composition={composition_ratio}"
+    stat = os.stat(args.data)
+    cache_key = hashlib.sha1(json.dumps({
+        "path": os.path.abspath(args.data), "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns, "rows": len(canonical),
+        "num_wps": num_wps, "cutoff": args.chemistry_cutoff,
+    }, sort_keys=True).encode()).hexdigest()
+    cache_csv = os.path.join(output_folder, "ti_training_framework_statistics.csv")
+    cache_meta = os.path.join(output_folder, "ti_training_framework_statistics.meta.json")
+    tc = time.perf_counter()
+    training = TiTrainingDistribution(
+        canonical, num_wps, args.chemistry_cutoff, ncpu, cache_csv, cache_meta, cache_key
     )
-    print(f"Original slots: {num_wps}")
-    print(f"Ti block capacity: {n_si_max}")
-    print(f"O block capacity: {n_o_max}")
-    print(f"Global columns: {global_df.columns.tolist()}")
-    print(f"Ti block columns (legacy si_* names): {si_df.columns.tolist()}")
-    print(f"O columns: {o_df.columns.tolist()}")
-    print(f"Discrete cell: {discrete_cell}")
-    print(f"Discrete coordinates: {discrete_coordinates}")
-    print(
-        "O construction: crystallographic skeleton prior with cached pooled "
-        "Ti-O and O-O ionic probability fields."
-    )
-    density_selector = OnlinePerSiNearestNeighborSelector(
-        canonical_df,
-        num_wps=num_wps,
-        requested_structures=args.sample,
-        nn_bins=args.nn_bins,
-        shift_range=args.nn_image_range,
-        overfill_penalty=args.nn_overfill_penalty,
-        selection_temperature=args.nn_selection_temperature,
-        safety_floor=args.si_min_terminal,
-        target_sigma_scale=args.nn_target_sigma_scale,
-        histogram_sigma_span=args.nn_histogram_sigma_span,
-        seed=args.seed,
-        gpu_device=("cuda" if torch.cuda.is_available() else "cpu"),
-        gpu_contact_batch=args.gpu_contact_batch,
-        gpu_shift_chunk=args.gpu_shift_chunk,
-        gpu_max_memory_gib=args.gpu_geometry_memory_gib,
-    )
-    tq = density_selector.training_quantiles
-    print(
-        "Online per-Ti nearest-neighbour selector: "
-        f"bins={args.nn_bins}, adaptive_block={args.selection_block_size}, "
-        f"round_size={args.nn_round_size}, safety_floor={args.si_min_terminal:.3f} A, "
-        f"gpu_geometry_cap={args.gpu_geometry_memory_gib:.2f} GiB"
-    )
-    print(
-        f"Geometry pipeline: workers={args.geometry_workers}, "
-        f"exact_images={(2 * args.nn_image_range + 1) ** 3}, "
-        f"O_search=beam{args.o_sequential_beam_width}, "
-        f"cached_candidates/site={args.o_sequential_candidates_per_site}, "
-        f"skeletons={args.o_sequential_skeletons}, "
-        f"TiO_sigma_scale={args.ionic_sio_sigma_scale:g}, "
-        f"OO_sigma_scale={args.ionic_oo_sigma_scale:g}, "
-        f"pool_capacity={args.sample}, "
-        f"pool_fill_candidate_batch={args.pool_fill_candidate_batch}, "
-        f"pool_candidate_batch={args.pool_candidate_batch}, "
-        f"adaptive_weight=(p={args.pool_weight_exponent:g},floor={args.pool_weight_floor:g},"
-        f"smooth={args.pool_weight_smoothing:g}), "
-        f"guard={args.pool_guard_min_fraction:.1%}..{args.pool_guard_max_fraction:.1%} "
-        f"(abs={args.pool_guard_absolute_floor:g}), "
-        f"replacement_tol={args.pool_replacement_relative_tolerance:.2%} "
-        f"(abs={args.pool_replacement_absolute_floor:g}), "
-        f"convergence_window={args.pool_convergence_window_sqrt_factor:g}*sqrt(N) "
-        f"clipped[{args.pool_convergence_window_min},{args.pool_convergence_window_max}], "
-        f"TiO/OO floors={args.o_sequential_sio_min:g}/"
-        f"{args.o_sequential_oo_min:g} A"
-    )
-    print(
-        "Per-Ti NN training reference:\n"
-        f"  valid structures={density_selector.training_structures}/{len(canonical_df)}, "
-        f"skipped={density_selector.skipped_training}, "
-        f"Ti environments={len(density_selector.training_values)}, "
-        f"mean Ti/structure={density_selector.mean_training_nsi:.2f}\n"
-        f"  mean/std={density_selector.target_mean:.4f}/"
-        f"{np.std(density_selector.training_values):.4f} A\n"
-        f"  q01/q05/q25/q50/q75/q95/q99="
-        f"{tq['q01']:.4f}/{tq['q05']:.4f}/{tq['q25']:.4f}/"
-        f"{tq['q50']:.4f}/{tq['q75']:.4f}/{tq['q95']:.4f}/{tq['q99']:.4f} A\n"
-        f"  Gaussian target: mu={density_selector.target_mean:.4f} A, "
-        f"sigma={density_selector.target_std:.4f} A"
-    )
+    timings["chemistry_extraction_s"] = time.perf_counter() - tc
+    print(f"Ti chemistry records: {len(training.frame)}; extraction failures={training.failures}", flush=True)
 
-    t_train_expand = time.perf_counter()
-    training_si = prepare_species_candidates(
-        canonical_df, num_wps, SI_CN, workers=args.geometry_workers
-    )
-    training_o = prepare_species_candidates(
-        canonical_df, num_wps, O_CN, workers=args.geometry_workers
-    )
-    training_prepared = combine_prepared_species(canonical_df, training_si, training_o)
-    training_expand_seconds = time.perf_counter() - t_train_expand
-    ionic_target = PooledIonicDistanceTarget(
-        training_prepared,
-        sio_sigma_scale=args.ionic_sio_sigma_scale,
-        oo_sigma_scale=args.ionic_oo_sigma_scale,
-        bins=args.o_shell_bins,
-        hard_sio_min=args.o_sequential_sio_min,
-        hard_oo_min=args.o_sequential_oo_min,
-    )
-    print(
-        "Narrowed pooled ionic targets: "
-        "Ti-O = Ti->O1..O6 plus O->Ti1..Ti3; O-O = nearest periodic O neighbour"
-    )
-    for name, label in (("sio", "Ti-O pooled"), ("oo", "O-O nearest")):
-        arr = ionic_target.training[name]
-        q = np.percentile(arr, [5, 50, 95])
-        print(
-            f"  {label}: count={len(arr)}, training mean/std="
-            f"{ionic_target.mu[name]:.4f}/{ionic_target.training_sigma[name]:.4f} A, "
-            f"target sigma={ionic_target.sigma[name]:.4f} A, "
-            f"q05/q50/q95={q[0]:.4f}/{q[1]:.4f}/{q[2]:.4f} A"
-        )
-
-    sequential_o = SequentialOxygenConstructor(
-        ionic_target,
-        n_o_max=n_o_max,
-        beam_width=args.o_sequential_beam_width,
-        candidates_per_site=args.o_sequential_candidates_per_site,
-        max_skeletons=args.o_sequential_skeletons,
-        seed=args.seed + 29,
-    )
-
-    o_noise_dim = 32
-    o_noise_scale = 1.0
-
+    tv = time.perf_counter()
     model = FactorizedVAE(
-        embedding_dim=128,
-        compress_dims=(512, 512),
-        decompress_dims=(512, 512),
-        context_dim=128,
-        l2scale=1e-5,
-        batch_size=args.nbatch,
-        epochs=args.epochs,
-        loss_factor=2.0,
-        kl_weight=1.0,
-        kl_warmup_epochs=min(50, args.epochs),
-        predicted_context_start=0.0,
-        predicted_context_end=args.context_end,
-        o_noise_dim=o_noise_dim,
-        o_noise_scale=o_noise_scale,
-        cuda=torch.cuda.is_available(),
-        verbose=True,
-        folder=model_folder,
+        embedding_dim=128, compress_dims=(512, 512), decompress_dims=(512, 512),
+        context_dim=128, l2scale=1e-5, batch_size=args.nbatch, epochs=args.epochs,
+        loss_factor=2.0, kl_weight=1.0, kl_warmup_epochs=min(50, args.epochs),
+        predicted_context_start=0.0, predicted_context_end=args.context_end,
+        cuda=torch.cuda.is_available(), verbose=True, folder=model_folder,
     )
-    if model._device.type == "cuda":
-        print(f"Device: cuda ({torch.cuda.get_device_name(model._device)})")
-    else:
-        print("Device: cpu")
+    model.fit(global_df, ti_df, o_df, global_discrete_columns=global_discrete,
+              si_discrete_columns=["si_skeleton_token"], o_discrete_columns=["o_skeleton_token"])
+    timings["vae_training_s"] = time.perf_counter() - tv
 
-    model.fit(
-        global_df,
-        si_df,
-        o_df,
-        global_discrete_columns=global_discrete,
-        si_discrete_columns=si_discrete,
-        o_discrete_columns=o_discrete,
-    )
-
+    ngpu = resolve_ngpu(args.ngpu)
     print(
-        "Training complete. Starting Ti sampling and adaptive fixed-capacity distribution-pool optimization.",
+        "Resolved resources: "
+        f"ncpu={ncpu} worker(s), ngpu={ngpu}; "
+        f"SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'unset')}, "
+        f"CPU_affinity={_cpu_affinity_count()}, "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}",
         flush=True,
     )
+    print("VAE training complete. Beginning bounded streaming Phase-A/B generation.", flush=True)
 
-
-    integrity_evaluator = TiO2IntegrityEvaluator(
-        max_ti_o=args.integrity_max_ti_o,
-        max_o_ti=args.integrity_max_o_ti,
-        max_angle_rms=args.integrity_max_angle_rms,
-        min_ti_pass_fraction=args.integrity_min_ti_pass_fraction,
-        min_o_pass_fraction=args.integrity_min_o_pass_fraction,
+    final_path, final_cif_folder, summary = run_streaming_phase_ab(
+        args=args, canonical=canonical, num_wps=num_wps, n_ti_max=n_ti_max,
+        ncpu=ncpu, ngpu=ngpu, output_folder=output_folder, data_name=data_name,
+        cache_key=cache_key, model=model, training=training, timings=timings,
+        global_seed=args.seed,
     )
-
-    pool = FixedCapacityDistributionPool(
-        capacity=args.sample,
-        density_selector=density_selector,
-        ionic_target=ionic_target,
-        weight_exponent=args.pool_weight_exponent,
-        weight_floor=args.pool_weight_floor,
-        weight_smoothing=args.pool_weight_smoothing,
-        guard_min_fraction=args.pool_guard_min_fraction,
-        guard_max_fraction=args.pool_guard_max_fraction,
-        guard_absolute_floor=args.pool_guard_absolute_floor,
-        replacement_relative_tolerance=args.pool_replacement_relative_tolerance,
-        replacement_absolute_floor=args.pool_replacement_absolute_floor,
-        convergence_window_sqrt_factor=args.pool_convergence_window_sqrt_factor,
-        convergence_window_min=args.pool_convergence_window_min,
-        convergence_window_max=args.pool_convergence_window_max,
-        convergence_relative_gain=args.pool_convergence_relative_gain,
-        convergence_max_swap_fraction=args.pool_convergence_max_swap_fraction,
-        convergence_max_swaps_floor=args.pool_convergence_max_swaps_floor,
-        minimum_postfill_multiplier=args.pool_minimum_postfill_multiplier,
-        minimum_postfill_capacity_fraction=args.pool_minimum_postfill_capacity_fraction,
-        maximum_postfill_candidates=args.pool_maximum_postfill_candidates,
-        topology_weight=args.pool_topology_weight,
-    )
-    accepted_count = 0
-    total_generated = 0
-    total_o_proposals = 0
-    rejected_overflow = 0
-    rejected_multiplicity = 0
-    rejected_reconstruction = 0
-    nn_safety_valid = 0
-    nn_selected_total = 0
-    confirmed_si_total = 0
-    exhausted_si_total = 0
-    sequential_total_states = 0
-    sequential_completed_total = 0
-    mask_totals = {
-        "invalid_space_group": 0,
-        "no_compatible_si_skeleton": 0,
-        "invalid_si_skeleton": 0,
-        "no_packing_feasible_si_skeleton": 0,
-        "packing_conditioned_si_coordinates": 0,
-        "no_compatible_o_skeleton": 0,
-    }
-    timing = {
-        "vae_si_generation": 0.0,
-        "cpu_si_expansion": 0.0,
-        "gpu_si_nn": 0.0,
-        "si_selection_scoring": 0.0,
-        "vae_o_generation": 0.0,
-        "cpu_o_expansion": 0.0,
-        "gpu_o_first_shell": 0.0,
-        "o_selection_scoring": 0.0,
-    }
-
-    geometry_executor = (
-        ProcessPoolExecutor(max_workers=args.geometry_workers)
-        if args.geometry_workers > 1 else None
-    )
-    o_worker_config = {
-        "n_o_max": n_o_max,
-        "beam_width": args.o_sequential_beam_width,
-        "candidates_per_site": args.o_sequential_candidates_per_site,
-        "max_skeletons": args.o_sequential_skeletons,
-    }
-    o_executor = (
-        ProcessPoolExecutor(
-            max_workers=args.geometry_workers,
-            mp_context=mp.get_context("spawn"),
-            initializer=_init_o_worker,
-            initargs=(ionic_target, o_worker_config),
-        )
-        if args.geometry_workers > 1 else None
-    )
-
-    for sample_round in range(1, args.max_sample_rounds + 1):
-        accepted_count = len(pool)
-        remaining = max(args.sample - accepted_count, 0)
-        phase = "fill" if remaining > 0 else "replace"
-        if phase == "replace":
-            pool.begin_round()
-        round_start = time.perf_counter()
-        adaptive = pool.adaptive_status()
-        if pool.convergence_reason is not None:
-            if pool.convergence_reason == "hard_postfill_cap":
-                print(
-                    "Safe stop: hard post-fill candidate cap reached "
-                    f"({pool.postfill_candidates}/{pool.maximum_postfill_candidates}).",
-                    flush=True,
-                )
-            else:
-                print(
-                    "Good-enough rolling convergence reached: "
-                    f"window={pool.convergence_window}, "
-                    f"postfill={pool.postfill_candidates}.",
-                    flush=True,
-                )
-            break
-
-        if remaining > 0:
-            # Keep a fixed additive fill workload instead of contracting the
-            # expensive oxygen-construction stage as the pool approaches full.
-            # Any candidates processed after the pool fills naturally become
-            # replacement trials within the same round.
-            candidate_target = max(
-                remaining,
-                args.pool_fill_candidate_batch,
-            )
-        else:
-            safe_budget_left = max(
-                pool.maximum_postfill_candidates - pool.postfill_candidates, 0
-            )
-            candidate_target = min(args.pool_candidate_batch, safe_budget_left)
-            if candidate_target <= 0:
-                print(
-                    "Safe stop: no post-fill candidate budget remains.",
-                    flush=True,
-                )
-                break
-        draw_size = min(
-            args.nn_round_size,
-            max(
-                int(np.ceil(candidate_target * args.nn_oversample_factor)),
-                min(args.min_terminal_round_size, args.nn_round_size),
-            ),
-        )
-
-        # Stage 1: sample only G and Si.  Oxygen is not decoded yet.
-        t_stage = time.perf_counter()
-        si_state_all = model.sample_si(
-            draw_size,
-            temperature=args.temperature,
-            hard=True,
-            enforce_composition_multiplicity=True,
-            composition_ratio=composition_ratio,
-            max_independent_sites=num_wps,
-            si_skeleton_feasibility=None,
-        )
-        timing["vae_si_generation"] += time.perf_counter() - t_stage
-        total_generated += draw_size
-        multiplicity_valid = np.asarray(si_state_all["valid_mask"], dtype=bool)
-        rejected_multiplicity += int((~multiplicity_valid).sum())
-        for key in mask_totals:
-            mask_totals[key] += int(si_state_all["stats"].get(key, 0))
-        valid_state_indices = np.flatnonzero(multiplicity_valid)
-        if len(valid_state_indices) == 0:
-            print(
-                f"Sampling round {sample_round}: generated={draw_size}, "
-                "no multiplicity-valid Ti candidates."
-            )
-            continue
-        si_state = subset_si_state(si_state_all, valid_state_indices)
-
-        # Reconstruct only Ti rows, then expand/check Ti geometry.
-        t_stage = time.perf_counter()
-        si_rows, si_source_positions, rejected_si_recon = blocks_to_si_rows(
-            si_state["global_df"], si_state["si_df"], num_wps, n_si_max
-        )
-        rejected_reconstruction += rejected_si_recon
-        if si_rows.empty:
-            timing["cpu_si_expansion"] += time.perf_counter() - t_stage
-            print(
-                f"Sampling round {sample_round}: generated={draw_size}, "
-                "no reconstructable Ti candidates."
-            )
-            continue
-        si_state = subset_si_state(si_state, si_source_positions)
-        si_prepared = prepare_species_candidates(
-            si_rows, num_wps, SI_CN,
-            workers=args.geometry_workers,
-            executor=geometry_executor,
-        )
-        si_combined = combine_prepared_species(si_rows, si_prepared)
-        timing["cpu_si_expansion"] += time.perf_counter() - t_stage
-
-        t_stage = time.perf_counter()
-        keep_rows, si_descriptions = density_selector.describe_batch(
-            si_rows, prepared=si_combined
-        )
-        timing["gpu_si_nn"] += time.perf_counter() - t_stage
-        safety_valid = len(si_descriptions)
-        nn_safety_valid += safety_valid
-        if not si_descriptions:
-            print(
-                f"Sampling round {sample_round}: generated={draw_size}, "
-                f"Ti_rows={len(si_rows)}, safety_valid=0."
-            )
-            continue
-
-        # Confirm exactly the best Ti frameworks currently needed.  They are
-        # frozen and retained while oxygen is repeatedly sampled around them.
-        t_stage = time.perf_counter()
-        framework_target = min(candidate_target, len(si_descriptions))
-        si_local = density_selector.select(
-            si_descriptions,
-            remaining=framework_target,
-            commit=False,
-            block_size=args.selection_block_size,
-            max_selected=framework_target,
-        )
-        timing["si_selection_scoring"] += time.perf_counter() - t_stage
-        confirmed_row_positions = np.asarray(
-            [keep_rows[int(i)] for i in si_local], dtype=int
-        )
-        confirmed_si_total += len(confirmed_row_positions)
-        if len(confirmed_row_positions) == 0:
-            continue
-        confirmed_state = subset_si_state(si_state, confirmed_row_positions)
-        confirmed_si_geometry = [si_combined[int(i)] for i in confirmed_row_positions]
-        confirmed_si_desc_indices = np.asarray(si_local, dtype=int)
-        unresolved = list(range(len(confirmed_row_positions)))
-        accepted_this_round = []
-        sequential_attempted = 0
-        sequential_completed = 0
-        sequential_passed = 0
-        sequential_scores = []
-        proposal_stats_round = {
-            "guided_attempted": 0, "explore_attempted": 0,
-            "guided_valid": 0, "explore_valid": 0,
-            "guided_retained": 0, "explore_retained": 0,
-            "probe_total": 0, "probe_valid": 0,
-        }
-
-        t_stage = time.perf_counter()
-        skeleton_result = model.sample_o_from_si(
-            confirmed_state,
-            proposals_per_si=args.o_sequential_skeletons,
-            temperature=args.temperature,
-            hard=True,
-            enforce_composition_multiplicity=True,
-            composition_ratio=composition_ratio,
-            max_independent_sites=num_wps,
-        )
-        timing["vae_o_generation"] += time.perf_counter() - t_stage
-        skeleton_parent = np.asarray(skeleton_result["parent"], dtype=int)
-        skeleton_valid = np.asarray(skeleton_result["valid_mask"], dtype=bool)
-        skeleton_tokens = {i: [] for i in unresolved}
-        for row_pos in np.flatnonzero(skeleton_valid):
-            parent = int(skeleton_parent[row_pos])
-            if parent in skeleton_tokens:
-                token = str(
-                    skeleton_result["o_df"].iloc[int(row_pos)]["o_skeleton_token"]
-                )
-                if token not in skeleton_tokens[parent]:
-                    skeleton_tokens[parent].append(token)
-
-        def process_framework_result(parent_global, result):
-            nonlocal sequential_completed, sequential_attempted, sequential_passed
-            if result is None:
-                return False
-            sequential_completed += 1
-            sequential_attempted += int(result["attempted_states"])
-            sequential_scores.append(float(result["score"]))
-            for key, value in result.get("proposal_stats", {}).items():
-                if key in proposal_stats_round:
-                    proposal_stats_round[key] += int(value)
-
-            one_global = confirmed_state["global_df"].iloc[[parent_global]].reset_index(drop=True)
-            one_si = confirmed_state["si_df"].iloc[[parent_global]].reset_index(drop=True)
-            full_rows, reconstruction_map, rej_over, rej_recon = blocks_to_lego_rows_with_map(
-                one_global, one_si, result["o_df"], num_wps, n_si_max, n_o_max
-            )
-            nonlocal rejected_overflow, rejected_reconstruction
-            rejected_overflow += rej_over
-            rejected_reconstruction += rej_recon
-            if full_rows.empty:
-                return False
-
-            t_desc = time.perf_counter()
-            si_item = confirmed_si_geometry[parent_global]
-            desc = ionic_target.describe(
-                np.asarray(si_item["si"], dtype=np.float32),
-                np.asarray(result["oxygen"], dtype=np.float32),
-                np.asarray(si_item["cell"], dtype=np.float32),
-                update_raw=True,
-            )
-            timing["gpu_o_first_shell"] += time.perf_counter() - t_desc
-            nn_desc = si_descriptions[int(confirmed_si_desc_indices[parent_global])]
-            integrity_desc = integrity_evaluator.evaluate(
-                np.asarray(si_item["si"], dtype=np.float32),
-                np.asarray(result["oxygen"], dtype=np.float32),
-                np.asarray(si_item["cell"], dtype=np.float32),
-            )
-            if not integrity_desc["integrity_valid"]:
-                decision = {"action": "integrity_reject", **integrity_desc}
-                integrity_evaluator.record(
-                    sample_round, parent_global, "integrity_reject", integrity_desc
-                )
-                accepted_this_round.append((parent_global, decision))
-                if parent_global in unresolved:
-                    unresolved.remove(parent_global)
-                return "integrity_reject"
-            decision = pool.consider(
-                full_rows.iloc[[0]].copy(), nn_desc, desc, integrity_desc
-            )
-            integrity_evaluator.record(
-                sample_round, parent_global, decision["action"], integrity_desc
-            )
-            accepted_this_round.append((parent_global, decision))
-            if parent_global in unresolved:
-                unresolved.remove(parent_global)
-            if decision["action"] in {"fill", "swap"}:
-                sequential_passed += 1
-            return decision["action"]
-
-        search_tasks = []
-        for parent_global in list(unresolved):
-            tokens = skeleton_tokens.get(parent_global, [])
-            if not tokens:
-                continue
-            si_item = confirmed_si_geometry[parent_global]
-            search_tasks.append((
-                int(parent_global),
-                confirmed_state["global_df"].iloc[parent_global].to_dict(),
-                np.asarray(si_item["si"], dtype=np.float32),
-                np.asarray(si_item["cell"], dtype=np.float32),
-                list(tokens),
-                int(args.seed + 1000003 * sample_round + 7919 * parent_global),
-            ))
-
-        manager_start = time.perf_counter()
-        manager_completed = len(confirmed_row_positions) - len(search_tasks)
-        manager_exhausted = manager_completed
-        manager_valid = 0
-        manager_retained = 0
-        manager_nonimproving = 0
-        manager_errors = 0
-
-        if o_executor is None:
-            _init_o_worker(ionic_target, o_worker_config)
-            for task in search_tasks:
-                payload = _search_one_si_framework(task)
-                manager_completed += 1
-                total_o_proposals += int(
-                    payload["result"]["attempted_states"]
-                    if payload["result"] is not None else 0
-                )
-                action = process_framework_result(
-                    payload["parent_index"], payload["result"]
-                )
-                if action is False:
-                    manager_exhausted += 1
-                else:
-                    manager_valid += 1
-                    if action in {"fill", "swap"}:
-                        manager_retained += 1
-                    else:
-                        manager_nonimproving += 1
-                if payload["error"]:
-                    manager_errors += 1
-                if pool.convergence_reason is not None:
-                    break
-        else:
-            task_iter = iter(search_tasks)
-            running = {}
-            for _ in range(min(args.geometry_workers, len(search_tasks))):
-                task = next(task_iter, None)
-                if task is None:
-                    break
-                future = o_executor.submit(_search_one_si_framework, task)
-                running[future] = task[0]
-
-            stop_submitting = False
-            while running:
-                done, _ = wait(tuple(running), return_when=FIRST_COMPLETED)
-                for future in done:
-                    running.pop(future, None)
-                    payload = future.result()
-                    manager_completed += 1
-                    result = payload["result"]
-                    if result is not None:
-                        total_o_proposals += int(result["attempted_states"])
-                    action = process_framework_result(
-                        payload["parent_index"], result
-                    )
-                    if action is False:
-                        manager_exhausted += 1
-                    else:
-                        manager_valid += 1
-                        if action in {"fill", "swap"}:
-                            manager_retained += 1
-                        else:
-                            manager_nonimproving += 1
-                    if payload["error"]:
-                        manager_errors += 1
-
-                    if pool.convergence_reason is not None:
-                        stop_submitting = True
-                    if not stop_submitting:
-                        task = next(task_iter, None)
-                        if task is not None:
-                            new_future = o_executor.submit(_search_one_si_framework, task)
-                            running[new_future] = task[0]
-
-                if stop_submitting:
-                    for future in running:
-                        future.cancel()
-                    break
-
-        timing["cpu_o_expansion"] += time.perf_counter() - manager_start
-        sequential_total_states += sequential_attempted
-        sequential_completed_total += sequential_completed
-        exhausted_si_total += len(unresolved)
-        accepted_count = len(pool)
-        nn_selected_total = pool.fill_accepts + pool.swap_accepts
-
-        nn_summary = density_selector.accepted_summary()
-        ionic_round = ionic_target.summary(scope="accepted")
-        adaptive = pool.adaptive_status()
-        weights = adaptive["weights"]
-        round_seconds = time.perf_counter() - round_start
-        construction_rate = (
-            manager_completed / max(time.perf_counter() - manager_start, 1.0e-9)
-        )
-        valid_yield = manager_valid / max(manager_completed, 1)
-        retained_actions = sum(
-            1 for _, decision in accepted_this_round
-            if decision["action"] in {"fill", "swap"}
-        )
-        fill_actions = sum(
-            1 for _, decision in accepted_this_round
-            if decision["action"] == "fill"
-        )
-        swap_actions = sum(
-            1 for _, decision in accepted_this_round
-            if decision["action"] == "swap"
-        )
-        reject_actions = sum(
-            1 for _, decision in accepted_this_round
-            if decision["action"] == "reject"
-        )
-        integrity_reject_actions = sum(
-            1 for _, decision in accepted_this_round
-            if decision["action"] == "integrity_reject"
-        )
-        if adaptive["window_ready"]:
-            convergence_text = (
-                f"window_gain={adaptive['window_relative_gain']:.3%}, "
-                f"window_swaps={adaptive['window_swaps']}/"
-                f"{pool.convergence_max_swaps}, "
-                f"postfill={pool.postfill_candidates}/"
-                f"{adaptive['maximum_postfill']}"
-            )
-        else:
-            history_count = max(len(pool.monitor_history) - 1, 0)
-            convergence_text = (
-                f"window={history_count}/{adaptive['window']}, "
-                f"postfill={pool.postfill_candidates}/"
-                f"{adaptive['minimum_postfill']} "
-                f"(hard_cap={adaptive['maximum_postfill']})"
-            )
-
-        print(
-            f"Sampling round {sample_round} [{phase}] | "
-            f"time={round_seconds:.1f}s | pool={accepted_count}/{args.sample} | "
-            f"Ti generated/reconstructed/safe/selected="
-            f"{draw_size}/{len(si_rows)}/{safety_valid}/{len(confirmed_row_positions)}\n"
-            f"  O processed/valid/exhausted/errors="
-            f"{manager_completed}/{manager_valid}/{manager_exhausted}/{manager_errors} "
-            f"({valid_yield:.1%} valid, {construction_rate:.2f}/s) | "
-            f"pool fill/swap/reject/integrity_reject="
-            f"{fill_actions}/{swap_actions}/{reject_actions}/{integrity_reject_actions} | "
-            f"orbit_states={sequential_attempted}\n"
-            f"  Loss adaptive/monitor={pool.loss:.6f}/{pool.monitor_loss:.6f} | "
-            f"TV NN/TiO/OO={adaptive['nn_tv']:.4f}/"
-            f"{adaptive['sio_tv']:.4f}/{adaptive['oo_tv']:.4f} | "
-            f"weights={weights['nn']:.3f}/{weights['sio']:.3f}/"
-            f"{weights['oo']:.3f} | topology={adaptive.get('topology_loss', float('nan')):.4f}\n"
-            f"  guard={adaptive['guard_fraction']:.2%} | "
-            f"min_improvement={adaptive['required_improvement']:.3e} | "
-            f"{convergence_text} | total_O_proposals={total_o_proposals}",
-            flush=True,
-        )
-
-    if geometry_executor is not None:
-        geometry_executor.shutdown(wait=True)
-    if o_executor is not None:
-        o_executor.shutdown(wait=True, cancel_futures=True)
-
-    accepted_count = len(pool)
-    if accepted_count < args.sample:
-        acceptance = accepted_count / total_generated if total_generated else 0.0
-        raise RuntimeError(
-            "Could not fill the requested fixed-capacity output pool after "
-            f"{args.max_sample_rounds} rounds: filled {accepted_count}/{args.sample}; "
-            f"acceptance={acceptance:.1%}."
-        )
-
-    synthetic = pool.rows().iloc[: args.sample].copy()
-    synthetic = restore_dtypes(
-        synthetic,
-        canonical_df,
-        num_wps,
-        discrete_cell,
-        discrete_coordinates,
-    )
-    print(
-        "Sampling summary:\n"
-        f"  Requested rows: {args.sample}\n"
-        f"  Total generated: {total_generated}\n"
-        f"  Rejected multiplicity-mask rows: {rejected_multiplicity}\n"
-        f"    invalid sampled space group: {mask_totals['invalid_space_group']}\n"
-        f"    no compatible Si skeleton: "
-        f"{mask_totals['no_compatible_si_skeleton']}\n"
-        f"    invalid sampled Si skeleton: {mask_totals['invalid_si_skeleton']}\n"
-        f"    no Si skeleton passing external feasibility gate: "
-        f"{mask_totals['no_packing_feasible_si_skeleton']}\n"
-        f"    Ti rows using externally conditioned coordinates: "
-        f"{mask_totals['packing_conditioned_si_coordinates']}\n"
-        f"    no compatible O skeleton: {mask_totals['no_compatible_o_skeleton']}\n"
-        f"  Rejected slot-overflow combinations: {rejected_overflow}\n"
-        f"  Rejected Wyckoff reconstructions: {rejected_reconstruction}\n"
-        f"  Retained fraction: {accepted_count / total_generated:.1%}\n"
-        f"  Complete valid candidates considered by pool: {pool.complete_candidates}\n"
-        f"  Initial fill accepts: {pool.fill_accepts}\n"
-        f"  Accepted replacements: {pool.swap_accepts}\n"
-        f"  Rejected replacements: {pool.rejections}\n"
-        f"  Final pool loss: {pool.loss:.6f}\n"
-        f"  Post-fill complete candidates: {pool.postfill_candidates}\n"
-        f"  Adaptive monitor loss: {pool.monitor_loss:.6f}\n"
-        f"  Convergence window: {pool.convergence_window}\n"
-        f"  Minimum post-fill candidates: {pool.minimum_postfill_candidates}\n"
-        f"  Hard post-fill cap: {pool.maximum_postfill_candidates}"
-    )
-
-    nn_diagnostics = os.path.join(
-        model_folder, "online_per_si_nn_probability.csv"
-    )
-    density_selector.diagnostics_frame().to_csv(nn_diagnostics, index=False)
-    raw_summary = density_selector.summarize_values(density_selector.raw_values)
-    accepted_summary = density_selector.accepted_summary()
-    print(
-        "Online per-Ti nearest-neighbour probability selection:\n"
-        f"  Safety-valid candidates: {nn_safety_valid}\n"
-        f"  Rejected terminal Ti-Ti contacts: {density_selector.rejected_safety}\n"
-        f"  Failed Ti geometry expansions: {density_selector.failed_geometry}\n"
-        f"  NN-probability-selected structures: {nn_selected_total}\n"
-        f"  Raw histogram TV distance: "
-        f"{density_selector.histogram_distance(density_selector.raw_counts):.4f}\n"
-        f"  Accepted histogram TV distance: {density_selector.histogram_distance():.4f}\n"
-        f"  Training Gaussian mean/std: "
-        f"{density_selector.target_mean:.4f}/{density_selector.target_std:.4f} A\n"
-        f"  Raw NN mean/std: {raw_summary['mean']:.4f}/{raw_summary['std']:.4f} A\n"
-        f"  Accepted NN mean/std: "
-        f"{accepted_summary['mean']:.4f}/{accepted_summary['std']:.4f} A\n"
-        f"  Accepted q05/q50/q95: "
-        f"{accepted_summary['q05']:.4f}/{accepted_summary['q50']:.4f}/"
-        f"{accepted_summary['q95']:.4f} A\n"
-        f"  NN diagnostics: {nn_diagnostics}"
-    )
-
-    raw_ionic = ionic_target.summary(scope="raw")
-    accepted_ionic = ionic_target.summary(scope="accepted")
-    timing_rows = [
-        {"stage": "training_cpu_species_expansion", "seconds": training_expand_seconds},
-    ] + [{"stage": key, "seconds": value} for key, value in timing.items()]
-    timing_path = os.path.join(model_folder, "sampling_stage_timing.csv")
-    pd.DataFrame(timing_rows).to_csv(timing_path, index=False)
-    print(
-        "Pooled ionic-distance construction:\n"
-        f"  Confirmed Ti frameworks: {confirmed_si_total}\n"
-        f"  Completed constructive searches: {sequential_completed_total}\n"
-        f"  Evaluated orbit states: {sequential_total_states}\n"
-        f"  Accepted structures: {ionic_target.accepted_structures}\n"
-        f"  Ti-O target mu/sigma: {ionic_target.mu['sio']:.4f}/"
-        f"{ionic_target.sigma['sio']:.4f} A\n"
-        f"  O-O target mu/sigma: {ionic_target.mu['oo']:.4f}/"
-        f"{ionic_target.sigma['oo']:.4f} A\n"
-        f"  Raw Ti-O mean/std/TV: {raw_ionic['sio']['mean']:.4f}/"
-        f"{raw_ionic['sio']['std']:.4f}/{raw_ionic['sio']['tv']:.4f}\n"
-        f"  Accepted Ti-O mean/std/TV: {accepted_ionic['sio']['mean']:.4f}/"
-        f"{accepted_ionic['sio']['std']:.4f}/{accepted_ionic['sio']['tv']:.4f}\n"
-        f"  Raw O-O mean/std/TV: {raw_ionic['oo']['mean']:.4f}/"
-        f"{raw_ionic['oo']['std']:.4f}/{raw_ionic['oo']['tv']:.4f}\n"
-        f"  Accepted O-O mean/std/TV: {accepted_ionic['oo']['mean']:.4f}/"
-        f"{accepted_ionic['oo']['std']:.4f}/{accepted_ionic['oo']['tv']:.4f}\n"
-        f"  Timing: {timing_path}"
-    )
-
-    integrity_path = os.path.join(model_folder, "tio2_integrity_candidates.csv")
-    pd.DataFrame(integrity_evaluator.records).to_csv(integrity_path, index=False)
-    print(
-        "TiO6/OTi3 integrity selection:\n"
-        f"  Checked complete candidates: {integrity_evaluator.checked}\n"
-        f"  Integrity-valid candidates: {integrity_evaluator.valid}\n"
-        f"  Valid fraction: {integrity_evaluator.valid / max(integrity_evaluator.checked, 1):.1%}\n"
-        f"  Topology weight: {args.pool_topology_weight:g}\n"
-        f"  Diagnostics: {integrity_path}"
-    )
-
-    output = os.path.join(
-        sample_folder,
-        f"{data_name}-FactorizedVAE-tio2-v1-cached-ionic-field-seed{args.seed}-{args.sample}.csv",
-    )
-    synthetic.to_csv(output, index=False)
-    final_model = os.path.join(model_folder, "models", "FactorizedVAE_final.pkl")
-    model.save(final_model)
-    print(f"Saved samples: {output}")
-    print(f"Saved model: {final_model}")
+    model_path = os.path.join(model_folder, "models", "FactorizedVAE_final.pkl")
+    model.save(model_path)
+    timings["total_s"] = time.perf_counter() - t0
+    summary["timings_seconds"] = timings
+    summary["saved_model"] = model_path
+    with open(os.path.join(output_folder, "streaming_phaseAB_summary.json"), "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    print(json.dumps(summary, indent=2))
+    print(f"Saved complete TiO2 rows: {final_path}")
+    print(f"Saved complete TiO2 CIFs: {final_cif_folder}")
+    print(f"Saved model: {model_path}")
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     main()
 
