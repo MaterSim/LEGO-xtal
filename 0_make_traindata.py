@@ -1,10 +1,37 @@
 #!/usr/bin/env python3
-"""Generate LEGO-Xtal training rows for a configurable binary chemistry.
+"""Learn local chemistry directly from physical structures in an ASE database.
 
-The first species is the building-center block and the second species is the
-conditioned sublattice. ``target_coordination`` remains the persistent role /
-SO(3)-reference label consumed by the finalized factorized workflow; it is not
-recomputed as a hard coordination-number filter.
+This v5 chemistry-training generator is intentionally independent of the old
+LEGO-Xtal tabular-representation, SO(3), VAE, and subgroup-augmentation path.
+
+Workflow
+--------
+PASS 1
+    Read raw ASE DB rows directly with row.toatoms().
+    Collect broad center-attachment and attachment-center distance spectra up
+    to a generous user-defined search radius.
+    Learn chemical-shell cutoffs from smoothed dCN/dr and cumulative CN(r),
+    using manually specified expected coordination numbers.
+
+PASS 2
+    Count per-site coordination at the learned shell cutoffs.
+    Reject structures whose center->attachment or attachment->center CN pass
+    fraction is below the requested threshold.
+
+PASS 3
+    Learn chemistry from accepted physical structures only:
+      * center-attachment radial distribution
+      * attachment-center-attachment angular distribution
+      * attachment-center radial distribution
+      * center-attachment-center angular distribution
+      * center-center radial distribution
+      * center-center-center angular distributions conditioned on the pair of
+        learned center-center radial-shell identities
+
+    Each accepted source structure carries total statistical weight 1 within each channel.
+    Major modes are detected from a smoothed weighted density and represented
+    by Gaussian peak position, width, and probability weight. Sampling bounds
+    are stored as mu +/- n_width * sigma.
 """
 from __future__ import annotations
 
@@ -12,901 +39,924 @@ import argparse
 import json
 import math
 import os
-import random
-from itertools import combinations
-from functools import partial
-from multiprocessing import Pool
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from pyxtal.db import database_topology
-from pyxtal.symmetry import Group
-from lego.builder import builder
-from pyxtal.util import new_struc_wo_energy
+from ase.db import connect
+from pymatgen.io.ase import AseAtomsAdaptor
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
+
+EPS = 1.0e-12
 
 
-def build_output_filename(output_dir, tag, discrete, discrete_cell):
-    suffix = "-discell.csv" if discrete and discrete_cell else "-dis.csv" if discrete else ".csv"
-    return os.path.join(output_dir, f"{tag}{suffix}")
+@dataclass
+class WeightedSamples:
+    values: list[float]
+    weights: list[float]
+    site_keys: list[str]
+    source_rows: list[int]
+
+    def __init__(self):
+        self.values = []
+        self.weights = []
+        self.site_keys = []
+        self.source_rows = []
+
+    def extend(self, values, site_weight_total, site_key, source_row):
+        clean = [float(v) for v in values if np.isfinite(v)]
+        if not clean:
+            return
+        weight = float(site_weight_total) / len(clean)
+        for value in clean:
+            self.values.append(value)
+            self.weights.append(weight)
+            self.site_keys.append(site_key)
+            self.source_rows.append(int(source_row))
+
+    def arrays(self):
+        return np.asarray(self.values, dtype=float), np.asarray(self.weights, dtype=float)
 
 
-def load_coord_ref_config(inline_json: str | None, json_file: str | None):
-    if json_file:
-        path = Path(json_file)
-        if not path.is_file():
-            raise FileNotFoundError(f"Coordination-reference file not found: {path}")
-        config = json.loads(path.read_text(encoding="utf-8"))
-    else:
-        try:
-            config = json.loads(inline_json or "")
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid --coord-ref-dict JSON: {exc}") from exc
-
-    if not isinstance(config, dict) or len(config) != 2:
-        raise ValueError("This factorized workflow requires exactly two species entries.")
-
-    normalized = {}
-    used_labels = set()
-    for species, entry in config.items():
-        if not isinstance(entry, dict):
-            raise ValueError(f"Configuration for {species} must be an object.")
-        missing = {"neighbor_species", "coordination", "reference"} - set(entry)
-        if missing:
-            raise ValueError(f"Configuration for {species} is missing {sorted(missing)}.")
-        coordination = int(entry["coordination"])
-        if coordination <= 0 or coordination in used_labels:
-            raise ValueError("Coordination/role labels must be distinct positive integers.")
-        used_labels.add(coordination)
-        reference = Path(str(entry["reference"])).expanduser()
-        if not reference.is_file():
-            raise FileNotFoundError(f"Reference CIF for {species} not found: {reference}")
-        normalized[str(species)] = {
-            "neighbor_species": str(entry["neighbor_species"]),
-            "coordination": coordination,
-            "reference": str(reference.resolve()),
-        }
-
-    species = list(normalized)
-    for symbol, entry in normalized.items():
-        if entry["neighbor_species"] not in normalized:
-            raise ValueError(f"Unknown neighbor species for {symbol}: {entry['neighbor_species']}")
-    return normalized, species
-
-
-def parse_composition(value: str, species: list[str]) -> list[int]:
-    try:
-        parts = [int(x.strip()) for x in value.split(",")]
-    except ValueError as exc:
-        raise ValueError("--composition must be comma-separated positive integers.") from exc
-    if len(parts) != len(species) or any(x <= 0 for x in parts):
-        raise ValueError(f"--composition must contain {len(species)} positive integers.")
-    return parts
-
-
-def set_site_target(site, value: int):
-    if hasattr(site, "set_target_coordination"):
-        site.set_target_coordination(int(value))
-    else:
-        if not hasattr(site, "property") or site.property is None:
-            site.property = {}
-        site.property["target_coordination"] = int(value)
-        site.target_coordination = int(value)
-
-
-def assign_configured_templates(xtal, config):
-    for site in xtal.atom_sites:
-        species = str(site.specie)
-        if species not in config:
-            raise ValueError(f"Unsupported species {species!r}; expected {list(config)}.")
-        set_site_target(site, config[species]["coordination"])
-
-
-def make_builder(config, species, composition, rcut):
-    """Create the binary builder in direct element-specific SO3 mode.
-
-    The configured coordination values remain attached to atom sites for the
-    factorized CSV block labels, but they do not route the SO3 objective and do
-    not activate builder.check_target_coordination().  A shared reference CIF
-    supplies one SO3 descriptor per element through the builder's established
-    multi-element pathway.
-    """
-    bu = builder(species, composition, verbose=False)
-    bu.set_descriptor_calculator(mykwargs={"rcut": float(rcut)})
-
-    reference_paths = {
-        os.path.realpath(config[symbol]["reference"])
-        for symbol in species
-    }
-    if len(reference_paths) != 1:
-        raise ValueError(
-            "The current multi-element builder accepts one shared reference "
-            "structure containing all configured species. Received distinct "
-            f"reference paths: {sorted(reference_paths)}"
-        )
-
-    reference_cif = next(iter(reference_paths))
-    bu.set_reference_enviroments(reference_cif)
-    return bu
-
-
-
-
-def _angle_deg(v1, v2):
-    n1 = float(np.linalg.norm(v1))
-    n2 = float(np.linalg.norm(v2))
-    if n1 <= 1.0e-12 or n2 <= 1.0e-12:
-        return np.nan
-    cosine = float(np.dot(v1, v2) / (n1 * n2))
-    return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
-
-
-def _ideal_angle_rms(vectors, coordination):
-    """Return RMS angular deviation for supported ideal polyhedra.
-
-    CN=4 is compared with a tetrahedron (six 109.471-degree angles).
-    CN=6 is compared with an octahedron (twelve 90-degree and three
-    180-degree angles). Other coordination labels receive no angular test.
-    """
-    if coordination not in (4, 6):
-        return np.nan
-    angles = np.sort(np.asarray([
-        _angle_deg(vectors[i], vectors[j])
-        for i in range(coordination)
-        for j in range(i + 1, coordination)
-    ], dtype=float))
-    if not np.all(np.isfinite(angles)):
-        return np.nan
-    if coordination == 4:
-        ideal = np.full(6, 109.47122063449069, dtype=float)
-    else:
-        ideal = np.asarray([90.0] * 12 + [180.0] * 3, dtype=float)
-    return float(np.sqrt(np.mean((angles - ideal) ** 2)))
-
-
-def _periodic_species_neighbors(structure, center_index, neighbor_species, radius):
+def _species_neighbors(structure, center_index, neighbor_species, radius):
     center = structure[center_index]
     neighbors = []
-    for neighbor in structure.get_neighbors(
-        center, radius, include_index=True, include_image=True
-    ):
+    for neighbor in structure.get_neighbors(center, radius, include_index=True, include_image=True):
         if str(neighbor.specie.symbol) != str(neighbor_species):
             continue
         neighbors.append({
             "distance": float(neighbor.nn_distance),
             "vector": np.asarray(neighbor.coords - center.coords, dtype=float),
+            "atom_index": int(neighbor.index),
+            "image": tuple(int(x) for x in neighbor.image),
         })
-    neighbors.sort(key=lambda item: item["distance"])
+    neighbors.sort(key=lambda item: (item["distance"], item["atom_index"], item["image"]))
     return neighbors
 
 
-def evaluate_local_integrity(
-    xtal,
-    config,
-    species,
-    similarity,
-    integrity,
-    source_index,
-    stage,
-):
-    """Evaluate periodic first-shell integrity after SO3 optimization."""
-    structure = xtal.to_pymatgen()
-    symbols = [str(site.specie.symbol) for site in structure]
-    report = {
-        "source_index": int(source_index),
-        "stage": str(stage),
-        "space_group": int(xtal.group.number),
-        "natoms": int(len(structure)),
-        "similarity": float(similarity) if similarity is not None else np.nan,
-        "accepted": False,
-        "rejection_reasons": "",
+def _angle_deg(v1, v2):
+    n1 = float(np.linalg.norm(v1))
+    n2 = float(np.linalg.norm(v2))
+    if n1 <= EPS or n2 <= EPS:
+        return float("nan")
+    cosine = float(np.dot(v1, v2) / (n1 * n2))
+    return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+
+
+def _weighted_quantile(values, weights, quantiles):
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    mask = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+    values = values[mask]
+    weights = weights[mask]
+    if len(values) == 0:
+        return [float("nan")] * len(quantiles)
+    order = np.argsort(values)
+    values = values[order]
+    weights = weights[order]
+    cumulative = np.cumsum(weights)
+    cumulative /= cumulative[-1]
+    return [float(np.interp(float(q), cumulative, values)) for q in quantiles]
+
+
+def _finite_stats(values):
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) == 0:
+        return {key: None for key in ("min", "q05", "q25", "median", "q75", "q95", "max", "mean")}
+    return {
+        "min": float(np.min(arr)),
+        "q05": float(np.quantile(arr, 0.05)),
+        "q25": float(np.quantile(arr, 0.25)),
+        "median": float(np.median(arr)),
+        "q75": float(np.quantile(arr, 0.75)),
+        "q95": float(np.quantile(arr, 0.95)),
+        "max": float(np.max(arr)),
+        "mean": float(np.mean(arr)),
     }
-    reasons = []
 
-    first, second = species
-    first_count = symbols.count(first)
-    report["similarity_per_building_center"] = (
-        float(similarity) / first_count
-        if similarity is not None and first_count > 0 else np.nan
-    )
 
-    for species_index, symbol in enumerate(species):
-        entry = config[symbol]
-        neighbor_symbol = entry["neighbor_species"]
-        coordination = int(entry["coordination"])
-        site_ids = [i for i, value in enumerate(symbols) if value == symbol]
-        site_records = []
+def _discover_attachment_species(database, building_center):
+    db = connect(database, serial=True)
+    all_species = set()
+    for row in db.select():
+        all_species.update(row.toatoms().get_chemical_symbols())
+    if building_center not in all_species:
+        raise ValueError(f"Building center {building_center!r} absent. Observed={sorted(all_species)}")
+    attachments = sorted(all_species - {building_center})
+    if len(attachments) != 1:
+        raise ValueError(
+            "v1 automatically supports one attachment species. "
+            f"Building center={building_center}; other species={attachments}."
+        )
+    return attachments[0]
 
-        for site_id in site_ids:
-            neighbors = _periodic_species_neighbors(
-                structure,
-                site_id,
-                neighbor_symbol,
-                integrity["neighbor_search_radius"],
-            )
-            if len(neighbors) < coordination:
-                site_records.append({
-                    "pass": False,
-                    "nth_distance": np.nan,
-                    "shell_gap": np.nan,
-                    "angle_rms": np.nan,
-                })
+
+def _collect_broad_distances(structures, center_species, neighbor_species, radius):
+    per_site = []
+    for item in structures:
+        structure = item["structure"]
+        symbols = [str(site.specie.symbol) for site in structure]
+        for site_id, symbol in enumerate(symbols):
+            if symbol != center_species:
                 continue
-
-            shell = neighbors[:coordination]
-            nth_distance = float(shell[-1]["distance"])
-            shell_gap = (
-                float(neighbors[coordination]["distance"] - nth_distance)
-                if len(neighbors) > coordination else np.nan
-            )
-            angle_rms = _ideal_angle_rms(
-                [item["vector"] for item in shell], coordination
-            )
-
-            max_distance = (
-                integrity["center_max_neighbor_distance"]
-                if species_index == 0
-                else integrity["neighbor_max_center_distance"]
-            )
-            min_gap = (
-                integrity["center_min_shell_gap"]
-                if species_index == 0
-                else integrity["neighbor_min_shell_gap"]
-            )
-            max_angle_rms = (
-                integrity["center_max_angle_rms"]
-                if species_index == 0
-                else integrity["neighbor_max_angle_rms"]
-            )
-
-            passed = nth_distance <= max_distance
-            if min_gap > 0:
-                passed = passed and np.isfinite(shell_gap) and shell_gap >= min_gap
-            if np.isfinite(max_angle_rms) and coordination in (4, 6):
-                passed = passed and np.isfinite(angle_rms) and angle_rms <= max_angle_rms
-
-            site_records.append({
-                "pass": bool(passed),
-                "nth_distance": nth_distance,
-                "shell_gap": shell_gap,
-                "angle_rms": angle_rms,
-            })
-
-        prefix = "building_center" if species_index == 0 else "conditioned_sublattice"
-        pass_fraction = (
-            float(np.mean([record["pass"] for record in site_records]))
-            if site_records else 0.0
-        )
-        nth_values = np.asarray(
-            [record["nth_distance"] for record in site_records], dtype=float
-        )
-        gap_values = np.asarray(
-            [record["shell_gap"] for record in site_records], dtype=float
-        )
-        angle_values = np.asarray(
-            [record["angle_rms"] for record in site_records], dtype=float
-        )
-        report[f"{prefix}_species"] = symbol
-        report[f"{prefix}_target_coordination"] = coordination
-        report[f"{prefix}_site_count"] = len(site_records)
-        report[f"{prefix}_pass_fraction"] = pass_fraction
-        report[f"{prefix}_nth_distance_max"] = (
-            float(np.nanmax(nth_values)) if np.any(np.isfinite(nth_values)) else np.nan
-        )
-        report[f"{prefix}_nth_distance_mean"] = (
-            float(np.nanmean(nth_values)) if np.any(np.isfinite(nth_values)) else np.nan
-        )
-        report[f"{prefix}_shell_gap_min"] = (
-            float(np.nanmin(gap_values)) if np.any(np.isfinite(gap_values)) else np.nan
-        )
-        report[f"{prefix}_shell_gap_mean"] = (
-            float(np.nanmean(gap_values)) if np.any(np.isfinite(gap_values)) else np.nan
-        )
-        report[f"{prefix}_angle_rms_max"] = (
-            float(np.nanmax(angle_values)) if np.any(np.isfinite(angle_values)) else np.nan
-        )
-        report[f"{prefix}_angle_rms_mean"] = (
-            float(np.nanmean(angle_values)) if np.any(np.isfinite(angle_values)) else np.nan
-        )
-
-        required_fraction = (
-            integrity["min_center_pass_fraction"]
-            if species_index == 0
-            else integrity["min_neighbor_pass_fraction"]
-        )
-        if pass_fraction + 1.0e-12 < required_fraction:
-            reasons.append(
-                f"{prefix}_pass_fraction={pass_fraction:.3f}<"
-                f"{required_fraction:.3f}"
-            )
-
-    max_so3 = integrity["max_so3_per_center"]
-    if (
-        np.isfinite(max_so3)
-        and np.isfinite(report["similarity_per_building_center"])
-        and report["similarity_per_building_center"] > max_so3
-    ):
-        reasons.append(
-            "similarity_per_building_center="
-            f"{report['similarity_per_building_center']:.6g}>{max_so3:.6g}"
-        )
-
-    report["accepted"] = len(reasons) == 0
-    report["rejection_reasons"] = ";".join(reasons)
-    return bool(report["accepted"]), report
+            neighbors = _species_neighbors(structure, site_id, neighbor_species, radius)
+            per_site.append([float(n["distance"]) for n in neighbors])
+    return per_site
 
 
+def _learn_shell_cutoff(per_site_distances, expected_cn, r_search, grid_size,
+                        smooth_sigma_bins, peak_prominence_fraction,
+                        valley_fraction, valley_min_width_A):
+    """Identify the first chemical shell from radial-density separation only.
 
-def coordination_label(value):
-    """Return the integer coordination label from PyXtal scalar/tuple storage."""
-    if isinstance(value, (tuple, list)):
-        if not value:
-            raise ValueError("Empty target_coordination tuple/list.")
-        # PyXtal may store (neighbor_species, coordination) or equivalent.
-        numeric = [item for item in value if isinstance(item, (int, float, np.integer, np.floating))]
-        if not numeric:
-            raise ValueError(f"No numeric coordination label in {value!r}.")
-        value = numeric[-1]
-    return int(value)
-
-def target_coordination_vector(xtal, n_wp, missing_value=0):
-    sites = getattr(xtal, "atom_sites", [])
-    if len(sites) > n_wp:
-        raise ValueError(f"Structure has {len(sites)} atom sites, exceeding N_wp={n_wp}.")
-    values = []
-    for index, site in enumerate(sites):
-        value = getattr(site, "target_coordination", None)
-        if value is None:
-            value = (getattr(site, "property", {}) or {}).get("target_coordination")
-        if value is None:
-            raise ValueError(
-                f"Missing target_coordination for site {index} "
-                f"({site.specie}, {site.wp.get_label()})."
-            )
-        label = coordination_label(value)
-        if label <= 0:
-            raise ValueError(
-                f"Invalid target_coordination={value!r} for site {index} "
-                f"({site.specie}, {site.wp.get_label()})."
-            )
-        values.append(label)
-    values.extend([int(missing_value)] * (n_wp - len(values)))
-    return np.asarray(values, dtype=int)
-
-
-def _cell_matrix_from_representation(representation):
-    """Return a row-vector cell matrix from one continuous LEGO row."""
-    a, b, c, alpha, beta, gamma = map(float, representation[1:7])
-    ca, cb, cg = np.cos(alpha), np.cos(beta), np.cos(gamma)
-    sg = np.sin(gamma)
-    if abs(sg) < 1.0e-12:
-        raise ValueError("Degenerate gamma in tabular representation.")
-    y3 = c * (ca - cb * cg) / sg
-    z3_sq = c * c - (c * cb) ** 2 - y3 ** 2
-    if z3_sq <= 1.0e-12:
-        raise ValueError("Degenerate cell metric in tabular representation.")
-    return np.asarray([
-        [a, 0.0, 0.0],
-        [b * cg, b * sg, 0.0],
-        [c * cb, y3, np.sqrt(z3_sq)],
-    ], dtype=float)
-
-
-def _deduplicate_fractional(frac, tol=1.0e-6):
-    frac = np.asarray(frac, dtype=float).reshape(-1, 3) % 1.0
-    unique = []
-    for point in frac:
-        if not any(
-            np.linalg.norm((point - other) - np.round(point - other)) <= tol
-            for other in unique
-        ):
-            unique.append(point)
-    return np.asarray(unique, dtype=float).reshape(-1, 3)
-
-
-def _expand_representation_orbits(representation, n_wp):
-    """Expand each occupied independent Wyckoff slot without assigning species."""
-    spg = int(round(float(representation[0])))
-    group = Group(spg)
-    orbits = []
-    for slot in range(n_wp):
-        base = 7 + 4 * slot
-        wp_index = int(round(float(representation[base])))
-        if wp_index < 0:
-            continue
-        if wp_index >= len(group):
-            raise ValueError(f"Invalid Wyckoff index {wp_index} for space group {spg}.")
-        generator = np.asarray(representation[base + 1:base + 4], dtype=float)
-        wp = group[wp_index]
-        frac = np.asarray([op.operate(generator) for op in wp.ops], dtype=float) % 1.0
-        frac = _deduplicate_fractional(frac)
-        if len(frac) != int(wp.multiplicity):
-            raise ValueError(
-                f"Slot {slot} ({wp.get_label()}) expands to {len(frac)} atoms; "
-                f"expected {wp.multiplicity}."
-            )
-        orbits.append((slot, frac))
-    return orbits
-
-
-def _species_distance_spectrum(frac_by_species, cell):
-    """Periodic species-resolved distance spectrum invariant to origin/setting."""
-    shifts = np.asarray(
-        [[i, j, k] for i in (-1, 0, 1)
-         for j in (-1, 0, 1) for k in (-1, 0, 1)],
-        dtype=float,
-    )
-    zero_shift = int(np.flatnonzero(np.all(shifts == 0, axis=1))[0])
-    names = list(frac_by_species)
-    spectrum = {}
-    for i, name_a in enumerate(names):
-        a = np.asarray(frac_by_species[name_a], dtype=float).reshape(-1, 3)
-        for j in range(i, len(names)):
-            name_b = names[j]
-            b = np.asarray(frac_by_species[name_b], dtype=float).reshape(-1, 3)
-            delta = a[:, None, None, :] - b[None, :, None, :] + shifts[None, None, :, :]
-            cart = np.einsum("...i,ij->...j", delta, cell)
-            dist = np.linalg.norm(cart, axis=-1)
-            if name_a == name_b:
-                ids = np.arange(len(a))
-                dist[ids, ids, zero_shift] = np.inf
-            values = np.sort(dist[np.isfinite(dist)].reshape(-1))
-            spectrum[(name_a, name_b)] = values
-    return spectrum
-
-
-def _source_distance_spectrum(xtal, species):
-    atoms = xtal.to_ase(resort=False, add_vaccum=False)
-    symbols = np.asarray(atoms.get_chemical_symbols(), dtype=object)
-    scaled = np.asarray(atoms.get_scaled_positions(wrap=True), dtype=float)
-    cell = np.asarray(atoms.cell.array, dtype=float)
-    frac_by_species = {}
-    for symbol in species:
-        frac_by_species[symbol] = scaled[symbols == symbol]
-        if len(frac_by_species[symbol]) == 0:
-            raise ValueError(f"Source structure contains no atoms of species {symbol}.")
-    return _species_distance_spectrum(frac_by_species, cell), {
-        symbol: len(frac_by_species[symbol]) for symbol in species
-    }
-
-
-def _spectra_match(candidate, reference, atol=2.0e-4, rtol=2.0e-5):
-    if candidate.keys() != reference.keys():
-        return False
-    for key in reference:
-        a, b = candidate[key], reference[key]
-        if a.shape != b.shape or not np.allclose(a, b, atol=atol, rtol=rtol):
-            return False
-    return True
-
-
-def _labels_for_valid_representation(
-    representation, xtal, n_wp, species, config,
-):
-    """Find the site labels that make a row exactly equivalent to ``xtal``.
-
-    ``get_tabular_representations`` may reorder independent sites.  More
-    importantly, some independently selected equivalent generators are not
-    mutually compatible because they correspond to different common origin or
-    setting choices.  Enumerate the binary species assignment allowed by the
-    atom counts and accept only a species-resolved periodic distance spectrum
-    identical to the source structure.
+    Expected CN is recorded for diagnostics but does not influence shell
+    selection. The first significant dCN/dr peak defines the first radial
+    density group. The shell cutoff is the entrance to the first persistent
+    low-density valley after that peak.
     """
-    orbits = _expand_representation_orbits(representation, n_wp)
-    if not orbits:
-        return None
-    cell = _cell_matrix_from_representation(representation)
-    reference, counts = _source_distance_spectrum(xtal, species)
-    first, second = species
-    required_first = counts[first]
-    all_ids = range(len(orbits))
+    if not per_site_distances:
+        raise ValueError("No local environments available for shell learning")
 
-    for n_first_sites in range(1, len(orbits)):
-        for chosen in combinations(all_ids, n_first_sites):
-            chosen = set(chosen)
-            if sum(len(orbits[i][1]) for i in chosen) != required_first:
-                continue
-            frac_first = np.concatenate([orbits[i][1] for i in chosen], axis=0)
-            frac_second = np.concatenate(
-                [orbits[i][1] for i in all_ids if i not in chosen], axis=0
-            )
-            if len(frac_second) != counts[second]:
-                continue
-            candidate = _species_distance_spectrum(
-                {first: frac_first, second: frac_second}, cell
-            )
-            if not _spectra_match(candidate, reference):
-                continue
-            labels = np.zeros(n_wp, dtype=int)
-            for orbit_id, (slot, _) in enumerate(orbits):
-                symbol = first if orbit_id in chosen else second
-                labels[slot] = int(config[symbol]["coordination"])
-            return labels
-    return None
+    edges = np.linspace(0.0, r_search, grid_size + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    dr = float(edges[1] - edges[0])
+    histogram = np.zeros(grid_size, dtype=float)
+    cn_curve = np.zeros(grid_size, dtype=float)
 
+    for distances in per_site_distances:
+        arr = np.asarray(distances, dtype=float)
+        arr = arr[(arr >= 0.0) & (arr <= r_search)]
+        counts, _ = np.histogram(arr, bins=edges)
+        histogram += counts
+        cn_curve += np.searchsorted(np.sort(arr), centers, side="right")
 
-def append_target_coordination(
-    representations, xtal, n_wp, species, config, diagnostics=None,
-):
-    """Append representation-specific role labels and reject invalid augmentation."""
-    expected_width = 7 + 4 * n_wp
-    output = []
-    rejected = 0
-    for row_index, representation in enumerate(representations):
-        representation = np.asarray(representation)
-        if representation.ndim != 1 or len(representation) != expected_width:
-            raise ValueError(
-                f"Representation {row_index} has shape {representation.shape}; "
-                f"expected width {expected_width}."
-            )
-        labels = _labels_for_valid_representation(
-            representation, xtal, n_wp, species, config
-        )
-        if labels is None:
-            rejected += 1
-            continue
-        output.append(np.concatenate((representation, labels)))
-    if diagnostics is not None:
-        diagnostics["augmentation_candidates"] = diagnostics.get(
-            "augmentation_candidates", 0
-        ) + len(representations)
-        diagnostics["augmentation_rejected"] = diagnostics.get(
-            "augmentation_rejected", 0
-        ) + rejected
-    return output
-
-
-def make_csv(total_reps, include_energy, include_label, discrete, discrete_cell, n_wp, filename):
-    total_reps = np.asarray(total_reps)
-    if total_reps.ndim != 2:
-        raise ValueError(f"Expected 2D representation array, got {total_reps.shape}")
-    columns = ["spg", "a", "b", "c", "alpha", "beta", "gamma"]
-    float_cols = set() if discrete_cell else set(range(1, 7))
-    for i in range(n_wp):
-        base = 7 + 4 * i
-        columns.extend([f"wp{i}", f"x{i}", f"y{i}", f"z{i}"])
-        if not discrete:
-            float_cols.update([base + 1, base + 2, base + 3])
-    columns.extend([f"target_coord{i}" for i in range(n_wp)])
-    if include_energy:
-        columns.append("energy")
-        float_cols.add(len(columns) - 1)
-    if include_label:
-        columns.append("label")
-    if total_reps.shape[1] != len(columns):
-        raise ValueError(f"CSV width mismatch: {total_reps.shape[1]} vs {len(columns)}")
-    data = {
-        name: total_reps[:, i].astype(float if i in float_cols else int)
-        for i, name in enumerate(columns)
-    }
-    os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
-    pd.DataFrame(data, columns=columns).to_csv(filename, index=False)
-    print(f"Saved {len(total_reps)} representations to {filename}")
-
-
-def process_one_xtal(item, params, base_seed):
-    source_index, xtal = item
-    random.seed(base_seed + source_index)
-    np.random.seed(base_seed + source_index)
-    try:
-        reps, reports = get_reps_from_xtal(xtal, params, source_index)
-        return source_index, reps, reports, None
-    except Exception as exc:
-        return source_index, [], [], f"{type(exc).__name__}: {exc}"
-
-
-def get_reps_from_xtal(xtal, params, source_index):
-    (
-        max_dof, n_atoms_min, n_atoms_max, max_energy, min_spg, n_wp,
-        max_per_structure, include_energy, discrete, discrete_cell,
-        discrete_resolution, subgroup_eps, config, species, composition, rcut,
-        integrity,
-    ) = params
-
-    assign_configured_templates(xtal, config)
-    bu = make_builder(config, species, composition, rcut)
-    atom_count = sum(xtal.numIons)
-    ff_energy = getattr(xtal, "ff_energy", None)
-    filter_by_energy = np.isfinite(max_energy)
-    if not (
-        xtal.dof <= max_dof
-        and n_atoms_min <= atom_count <= n_atoms_max
-        and (not filter_by_energy or (ff_energy is not None and ff_energy <= max_energy))
-        and xtal.group.number >= min_spg
-        and len(xtal.atom_sites) <= n_wp
-    ):
-        return [], []
-    target_coordination_vector(xtal, n_wp)
-    current_energy = ff_energy if include_energy else None
-
-    xtal_opt, sim_parent, _ = bu.optimize_xtal(xtal, add_db=False)
-    if xtal_opt is None or not xtal_opt.check_validity(bu.criteria):
-        return [], []
-
-    integrity_reports = []
-    if integrity["enabled"]:
-        accepted, report = evaluate_local_integrity(
-            xtal_opt, config, species, sim_parent, integrity,
-            source_index=source_index, stage="parent",
-        )
-        integrity_reports.append(report)
-        if not accepted:
-            print(
-                f"Source {source_index} rejected after SO3: "
-                f"{report['rejection_reasons']}"
-            )
-            return [], integrity_reports
-
-    reps = []
-    augmentation_diagnostics = {}
-    n_wps = len(xtal_opt.atom_sites)
-    n_max_initial = max(1, int(0.6 * max_per_structure * np.ceil(n_wps / n_wp)))
-    initial = xtal_opt.get_tabular_representations(
-        N_wp=n_wp, N_max=n_max_initial, discrete=discrete,
-        discrete_cell=discrete_cell, N_grids=discrete_resolution,
-    ) or []
-    initial = append_target_coordination(
-        initial, xtal_opt, n_wp, species, config, augmentation_diagnostics
+    n_sites = len(per_site_distances)
+    histogram /= n_sites
+    cn_curve /= n_sites
+    dcn_dr = histogram / dr
+    smooth = gaussian_filter1d(
+        dcn_dr,
+        sigma=float(smooth_sigma_bins),
+        mode="nearest",
     )
-    if include_energy and current_energy is not None:
-        initial = [np.append(rep, current_energy) for rep in initial]
-    reps.extend(initial)
 
-    max_cell_factor = max(n_atoms_max / sum(xtal_opt.numIons), 1.0)
-    trial_cache = [xtal_opt]
-    for group_type in ("t", "k"):
-        for _ in range(20):
-            if len(reps) >= max_per_structure:
-                return reps[:max_per_structure], integrity_reports
-            xtal_sub = xtal_opt.subgroup_once(
-                eps=subgroup_eps, group_type=group_type,
-                max_cell=max_cell_factor, mut_lat=False,
-            )
-            if xtal_sub is None:
-                xtal0 = xtal_opt.subgroup_once(group_type="t")
-                if xtal0 is not None:
-                    xtal_sub = xtal0.subgroup_once(
-                        eps=subgroup_eps, group_type="t",
-                        max_cell=max_cell_factor, mut_lat=False,
-                    )
-            if xtal_sub is None:
-                continue
-            para = xtal_sub.lattice.get_para(degree=True)
-            if not (
-                xtal_sub.get_dof() <= max_dof
-                and len(xtal_sub.atom_sites) <= n_wp
-                and max(para[:3]) < 50
-                and min(para[3:]) > 30
-                and max(para[3:]) < 150
-            ):
-                continue
-            target_coordination_vector(xtal_sub, n_wp)
-            if not new_struc_wo_energy(xtal_sub, trial_cache, 0.025, 0.025, 1.0):
-                continue
-            try:
-                xtal_sub_opt, sim_sub, _ = bu.optimize_xtal(xtal_sub, add_db=False)
-            except Exception:
-                continue
-            if xtal_sub_opt is None or not xtal_sub_opt.check_validity(bu.criteria):
-                continue
-            if integrity["enabled"]:
-                accepted, report = evaluate_local_integrity(
-                    xtal_sub_opt, config, species, sim_sub, integrity,
-                    source_index=source_index, stage=f"subgroup_{group_type}",
-                )
-                integrity_reports.append(report)
-                if not accepted:
-                    continue
-            trial_cache.append(xtal_sub_opt)
-            n_max_sub = max(
-                1, int(0.2 * max_per_structure * np.ceil(len(xtal_sub_opt.atom_sites) / n_wp))
-            )
-            sub = xtal_sub_opt.get_tabular_representations(
-                N_wp=n_wp, N_max=n_max_sub, discrete=discrete,
-                discrete_cell=discrete_cell, N_grids=discrete_resolution,
-            ) or []
-            sub = append_target_coordination(
-                sub, xtal_sub_opt, n_wp, species, config,
-                augmentation_diagnostics,
-            )
-            if include_energy and current_energy is not None:
-                sub = [np.append(rep, current_energy) for rep in sub]
-            reps.extend(sub)
-    if augmentation_diagnostics.get("augmentation_rejected", 0):
-        print(
-            "Augmentation validation: rejected "
-            f"{augmentation_diagnostics['augmentation_rejected']}/"
-            f"{augmentation_diagnostics['augmentation_candidates']} "
-            "incompatible tabular representations."
+    maximum = float(np.max(smooth)) if len(smooth) else 0.0
+    prominence = max(maximum * float(peak_prominence_fraction), EPS)
+    peak_ids, peak_props = find_peaks(smooth, prominence=prominence)
+
+    if len(peak_ids) == 0:
+        raise RuntimeError(
+            "No significant dCN/dr peak found. Increase --r-search, reduce "
+            "--shell-smooth-sigma-bins, or reduce "
+            "--shell-peak-prominence-fraction."
         )
-    return reps[:max_per_structure], integrity_reports
+
+    first_peak_id = int(np.min(peak_ids))
+    first_peak_height = float(smooth[first_peak_id])
+    valley_limit = first_peak_height * float(valley_fraction)
+    min_bins = max(1, int(math.ceil(float(valley_min_width_A) / dr)))
+
+    selected_id = None
+    valley_regions = []
+    start = None
+
+    for index in range(first_peak_id + 1, len(smooth)):
+        low = bool(smooth[index] <= valley_limit + EPS)
+        if low and start is None:
+            start = index
+        elif not low and start is not None:
+            end = index - 1
+            width_A = float(edges[end + 1] - edges[start])
+            persistent = bool(end - start + 1 >= min_bins)
+            valley_regions.append({
+                "start_index": int(start),
+                "end_index": int(end),
+                "start_r_A": float(edges[start]),
+                "end_r_A": float(edges[end + 1]),
+                "width_A": width_A,
+                "persistent": persistent,
+            })
+            if selected_id is None and persistent:
+                selected_id = int(start)
+                break
+            start = None
+
+    if selected_id is None and start is not None:
+        end = len(smooth) - 1
+        width_A = float(edges[end + 1] - edges[start])
+        persistent = bool(end - start + 1 >= min_bins)
+        valley_regions.append({
+            "start_index": int(start),
+            "end_index": int(end),
+            "start_r_A": float(edges[start]),
+            "end_r_A": float(edges[end + 1]),
+            "width_A": width_A,
+            "persistent": persistent,
+        })
+        if persistent:
+            selected_id = int(start)
+
+    if selected_id is None:
+        raise RuntimeError(
+            "No persistent low-density valley found after the first dCN/dr "
+            "peak. Increase --r-search, increase --shell-valley-fraction, or "
+            "reduce --shell-valley-min-width."
+        )
+
+    prominences = peak_props.get(
+        "prominences",
+        np.zeros(len(peak_ids), dtype=float),
+    )
+    peaks = [
+        {
+            "r_A": float(centers[index]),
+            "dcn_dr": float(smooth[index]),
+            "prominence": float(prom),
+            "mean_cn_at_r": float(cn_curve[index]),
+        }
+        for index, prom in zip(peak_ids, prominences)
+    ]
+
+    return {
+        "r_shell_A": float(edges[selected_id]),
+        "expected_cn": int(expected_cn),
+        "mean_cn_at_shell": float(cn_curve[selected_id]),
+        "selection_mode": "first_persistent_low_density_valley_after_first_peak",
+        "valley_fraction": float(valley_fraction),
+        "valley_min_width_A": float(valley_min_width_A),
+        "first_peak": {
+            "r_A": float(centers[first_peak_id]),
+            "dcn_dr": first_peak_height,
+            "valley_limit": float(valley_limit),
+        },
+        "selected_candidate": {
+            "r_A": float(edges[selected_id]),
+            "mean_cn": float(cn_curve[selected_id]),
+            "dcn_dr": float(smooth[selected_id]),
+            "grid_index": int(selected_id),
+        },
+        "dcn_dr_peaks": peaks,
+        "valley_regions": valley_regions,
+        "grid": {
+            "r_A": centers.tolist(),
+            "cn_mean": cn_curve.tolist(),
+            "dcn_dr_raw": dcn_dr.tolist(),
+            "dcn_dr_smooth": smooth.tolist(),
+        },
+    }
+
+
+def _fit_major_gaussian_peaks(samples, n_peak, domain, grid_size,
+                              smooth_sigma_bins, prominence_fraction, n_width,
+                              exclude_right_boundary=False):
+    values, weights = samples.arrays()
+    mask = (
+        np.isfinite(values)
+        & np.isfinite(weights)
+        & (weights > 0)
+        & (values >= domain[0])
+        & (values <= domain[1])
+    )
+    values = values[mask]
+    weights = weights[mask]
+    if len(values) == 0:
+        return {
+            "status": "empty",
+            "sample_count": 0,
+            "effective_site_weight": 0.0,
+            "peaks": [],
+            "retained_probability_mass": 0.0,
+            "discarded_probability_mass": 0.0,
+            "excluded_boundary_probability_mass": 0.0,
+        }
+
+    edges = np.linspace(float(domain[0]), float(domain[1]), int(grid_size) + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    density, _ = np.histogram(values, bins=edges, weights=weights)
+    width = float(edges[1] - edges[0])
+    total_weight = float(np.sum(weights))
+    if np.sum(density) > 0:
+        density = density / (np.sum(density) * width)
+    smooth = gaussian_filter1d(
+        density,
+        sigma=float(smooth_sigma_bins),
+        mode="nearest",
+    )
+
+    maximum = float(np.max(smooth))
+    prominence = max(maximum * float(prominence_fraction), EPS)
+    peak_ids, props = find_peaks(smooth, prominence=prominence)
+    if len(peak_ids) == 0:
+        peak_ids = np.asarray([int(np.argmax(smooth))], dtype=int)
+        prominences = np.asarray([maximum], dtype=float)
+    else:
+        prominences = np.asarray(props["prominences"], dtype=float)
+
+    # Every candidate peak gets a local basin bounded by the minimum-density
+    # point between adjacent detected peaks. Edge basins are open at the domain
+    # boundary and are explicitly marked.
+    ordered = sorted(
+        zip(peak_ids.tolist(), prominences.tolist()),
+        key=lambda item: item[0],
+    )
+    boundaries = []
+    for (left_id, _), (right_id, _) in zip(ordered[:-1], ordered[1:]):
+        local = smooth[left_id:right_id + 1]
+        boundaries.append(int(left_id + int(np.argmin(local))))
+
+    candidates = []
+    for peak_order, (peak_id, peak_prominence) in enumerate(ordered):
+        left_id = 0 if peak_order == 0 else boundaries[peak_order - 1]
+        right_id = len(centers) - 1 if peak_order == len(ordered) - 1 else boundaries[peak_order]
+        left_open = peak_order == 0
+        right_open = peak_order == len(ordered) - 1
+
+        lower = float(edges[left_id])
+        upper = float(edges[right_id + 1])
+        if peak_order < len(ordered) - 1:
+            use = (values >= lower) & (values < upper)
+        else:
+            use = (values >= lower) & (values <= upper)
+
+        local_values = values[use]
+        local_weights = weights[use]
+        mass = float(np.sum(local_weights))
+        if mass <= EPS:
+            continue
+
+        mu = float(np.sum(local_weights * local_values) / mass)
+        variance = float(
+            np.sum(local_weights * (local_values - mu) ** 2) / mass
+        )
+        sigma = float(np.sqrt(max(variance, EPS)))
+        boundary_truncated = bool(exclude_right_boundary and right_open)
+
+        candidates.append({
+            "mu": mu,
+            "sigma": sigma,
+            "weight": float(mass / total_weight),
+            "peak_height": float(smooth[peak_id]),
+            "sampling_min": float(max(domain[0], mu - n_width * sigma)),
+            "sampling_max": float(min(domain[1], mu + n_width * sigma)),
+            "assigned_sample_count": int(np.sum(use)),
+            "assigned_effective_weight": mass,
+            "initial_peak_location": float(centers[peak_id]),
+            "prominence": float(peak_prominence),
+            "basin_min": lower,
+            "basin_max": upper,
+            "left_basin_open": bool(left_open),
+            "right_basin_open": bool(right_open),
+            "boundary_truncated": boundary_truncated,
+        })
+
+    generative_candidates = [
+        item for item in candidates if not item["boundary_truncated"]
+    ]
+    ranked = sorted(
+        generative_candidates,
+        key=lambda item: (
+            item["peak_height"],
+            item["prominence"],
+        ),
+        reverse=True,
+    )[: int(n_peak)]
+    fitted = list(ranked)
+
+    retained_mass = float(sum(item["weight"] for item in fitted))
+    excluded_boundary_mass = float(
+        sum(item["weight"] for item in candidates if item["boundary_truncated"])
+    )
+    discarded_mass = float(max(0.0, 1.0 - retained_mass - excluded_boundary_mass))
+
+    q_names = ["q05", "q25", "median", "q75", "q95"]
+    q_values = _weighted_quantile(
+        values,
+        weights,
+        [0.05, 0.25, 0.5, 0.75, 0.95],
+    )
+    return {
+        "status": "ok",
+        "sample_count": int(len(values)),
+        "effective_site_weight": total_weight,
+        "domain": [float(domain[0]), float(domain[1])],
+        "peaks": fitted,
+        "all_detected_peak_basins": sorted(candidates, key=lambda item: item["mu"]),
+        "retained_probability_mass": retained_mass,
+        "discarded_probability_mass": discarded_mass,
+        "excluded_boundary_probability_mass": excluded_boundary_mass,
+        "weighted_quantiles": dict(zip(q_names, q_values)),
+    }
+
+
+def _channel_summary_lines(title, model, unit):
+    lines = ["-" * 60, title, "-" * 60]
+    if model.get("status") != "ok":
+        lines.append("Status                         : EMPTY")
+        return lines
+    lines.append(f"Samples                        : {model['sample_count']}")
+    lines.append(f"Effective site weight          : {model['effective_site_weight']:.3f}")
+    q = model["weighted_quantiles"]
+    lines.append(
+        f"Weighted q05/q25/q50/q75/q95   : {q['q05']:.5f} / {q['q25']:.5f} / "
+        f"{q['median']:.5f} / {q['q75']:.5f} / {q['q95']:.5f} {unit}"
+    )
+    lines.append("")
+    lines.append(
+        f"{'Peak':>4s}  {'height':>12s}  {'prominence':>12s}  "
+        f"{'weight':>10s}  {'mu':>12s}  {'sigma':>12s}  "
+        f"{'basin':>25s}  {'sample interval':>27s}"
+    )
+    for index, peak in enumerate(model["peaks"], start=1):
+        lines.append(
+            f"{index:4d}  {peak['peak_height']:12.6g}  "
+            f"{peak['prominence']:12.6g}  {peak['weight']:10.5f}  "
+            f"{peak['mu']:12.5f}  {peak['sigma']:12.5f}  "
+            f"[{peak['basin_min']:.5f}, {peak['basin_max']:.5f}]  "
+            f"[{peak['sampling_min']:.5f}, {peak['sampling_max']:.5f}] {unit}"
+        )
+    lines.append(
+        f"Retained probability mass      : {model['retained_probability_mass']:.6f}"
+    )
+    lines.append(
+        f"Discarded probability mass     : {model['discarded_probability_mass']:.6f}"
+    )
+    if model.get("excluded_boundary_probability_mass", 0.0) > EPS:
+        lines.append(
+            "Boundary-truncated mass         : "
+            f"{model['excluded_boundary_probability_mass']:.6f}"
+        )
+    return lines
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate factorized LEGO-Xtal training CSV data.")
+    parser = argparse.ArgumentParser(description="Learn local chemistry from raw physical structures in an ASE DB.")
     parser.add_argument("--database", default="data/source/tio2.db")
-    parser.add_argument("--tag", required=True)
-    parser.add_argument("--output-dir", default="data/train")
-    parser.add_argument("--max_atoms", type=int, default=500)
-    parser.add_argument("--min_spg", type=int, default=0)
-    parser.add_argument("--max_dof", type=int, default=24)
-    parser.add_argument("--max_wp", type=int, default=8)
-    parser.add_argument("--max_energy", type=float, default=float("inf"))
-    parser.add_argument("--max_per_struc", type=int, default=500)
-    parser.add_argument("--label", action="store_true")
-    parser.add_argument("--energy", action="store_true")
-    parser.add_argument("--discrete", type=int, metavar="N_GRIDS")
-    parser.add_argument("--discrete_cell", action="store_true")
-    parser.add_argument("--rcut", type=float, default=2.4)
+    parser.add_argument("--building-center", required=True)
+    parser.add_argument("--center-attachment-cn", type=int, required=True)
+    parser.add_argument("--attachment-center-cn", type=int, required=True)
+    parser.add_argument("--r-search", type=float, required=True)
+    parser.add_argument("--n-peak", type=int, default=3)
+    parser.add_argument("--n-width", type=float, default=2.0)
+    parser.add_argument("--min-cn-pass-fraction", type=float, default=1.0)
+    parser.add_argument("--output-dir", default="data/chemistry")
+    parser.add_argument("--grid-size", type=int, default=1000)
+    parser.add_argument("--shell-smooth-sigma-bins", type=float, default=6.0)
+    parser.add_argument("--shell-peak-prominence-fraction", type=float, default=0.03)
+    parser.add_argument("--shell-valley-fraction", type=float, default=0.01)
     parser.add_argument(
-        "--no-integrity-filter", action="store_true",
-        help="Disable the post-SO3 local coordination/polyhedron filter.",
+        "--shell-valley-min-width", type=float, default=0.10,
+        help="Minimum persistent low-density valley width in Angstrom.",
     )
-    parser.add_argument("--integrity-neighbor-radius", type=float, default=6.0)
-    parser.add_argument("--center-max-neighbor-distance", type=float, default=2.6)
-    parser.add_argument("--center-min-shell-gap", type=float, default=0.15)
-    parser.add_argument("--center-max-angle-rms", type=float, default=20.0)
-    parser.add_argument("--neighbor-max-center-distance", type=float, default=2.6)
-    parser.add_argument("--neighbor-min-shell-gap", type=float, default=0.10)
-    parser.add_argument(
-        "--neighbor-max-angle-rms", type=float, default=float("inf"),
-        help="Optional tetrahedral/octahedral angular RMS limit for species 2.",
-    )
-    parser.add_argument("--min-center-pass-fraction", type=float, default=1.0)
-    parser.add_argument("--min-neighbor-pass-fraction", type=float, default=1.0)
-    parser.add_argument(
-        "--max-so3-per-center", type=float, default=5.0,
-        help="Maximum multiplicity-weighted LEGO SO3 objective per expanded building-center atom.",
-    )
-    parser.add_argument(
-        "--integrity-report", default=None,
-        help="CSV audit path. Default: <output-dir>/<tag>-integrity.csv",
-    )
-    parser.add_argument("--ncpu", type=int, default=1)
-    parser.add_argument("--chunksize", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=42)
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--coord-ref-dict")
-    group.add_argument("--coord-ref-file")
-    parser.add_argument(
-        "--composition", default="1,2",
-        help="Stoichiometric coefficients in coord-reference species order.",
-    )
+    parser.add_argument("--peak-smooth-sigma-bins", type=float, default=5.0)
+    parser.add_argument("--peak-prominence-fraction", type=float, default=0.03)
+    parser.add_argument("--progress-every", type=int, default=10)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    config, species = load_coord_ref_config(args.coord_ref_dict, args.coord_ref_file)
-    composition = parse_composition(args.composition, species)
     if not os.path.isfile(args.database):
         raise FileNotFoundError(args.database)
-    for name, value in (("max_atoms", args.max_atoms), ("max_wp", args.max_wp),
-                        ("max_per_struc", args.max_per_struc), ("ncpu", args.ncpu),
-                        ("chunksize", args.chunksize)):
-        if value < 1:
-            raise ValueError(f"--{name} must be positive.")
-    if args.discrete is not None and args.discrete < 2:
-        raise ValueError("--discrete must be at least 2.")
-    if args.discrete_cell and args.discrete is None:
-        args.discrete_cell = False
+    if args.center_attachment_cn <= 0 or args.attachment_center_cn <= 0:
+        raise ValueError("Coordination numbers must be positive")
+    if args.r_search <= 0 or args.n_peak <= 0 or args.n_width <= 0:
+        raise ValueError("--r-search, --n-peak, and --n-width must be positive")
+    if not 0.0 <= args.min_cn_pass_fraction <= 1.0:
+        raise ValueError("--min-cn-pass-fraction must lie in [0, 1]")
+    if args.grid_size < 100:
+        raise ValueError("--grid-size must be at least 100")
+    if not 0.0 < args.shell_valley_fraction < 1.0:
+        raise ValueError("--shell-valley-fraction must lie in (0, 1)")
+    if args.shell_valley_min_width <= 0:
+        raise ValueError("--shell-valley-min-width must be positive")
 
+    center_species = str(args.building_center)
+    attachment_species = _discover_attachment_species(args.database, center_species)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    for name, value in (
-        ("integrity_neighbor_radius", args.integrity_neighbor_radius),
-        ("center_max_neighbor_distance", args.center_max_neighbor_distance),
-        ("neighbor_max_center_distance", args.neighbor_max_center_distance),
-    ):
-        if value <= 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be positive.")
-    for name, value in (
-        ("center_min_shell_gap", args.center_min_shell_gap),
-        ("neighbor_min_shell_gap", args.neighbor_min_shell_gap),
-    ):
-        if value < 0:
-            raise ValueError(f"--{name.replace('_', '-')} cannot be negative.")
-    for name, value in (
-        ("min_center_pass_fraction", args.min_center_pass_fraction),
-        ("min_neighbor_pass_fraction", args.min_neighbor_pass_fraction),
-    ):
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"--{name.replace('_', '-')} must lie in [0, 1].")
+    db = connect(args.database, serial=True)
+    rows = list(db.select())
+    structures = []
+    failures = []
 
-    integrity = {
-        "enabled": not args.no_integrity_filter,
-        "neighbor_search_radius": float(args.integrity_neighbor_radius),
-        "center_max_neighbor_distance": float(args.center_max_neighbor_distance),
-        "center_min_shell_gap": float(args.center_min_shell_gap),
-        "center_max_angle_rms": float(args.center_max_angle_rms),
-        "neighbor_max_center_distance": float(args.neighbor_max_center_distance),
-        "neighbor_min_shell_gap": float(args.neighbor_min_shell_gap),
-        "neighbor_max_angle_rms": float(args.neighbor_max_angle_rms),
-        "min_center_pass_fraction": float(args.min_center_pass_fraction),
-        "min_neighbor_pass_fraction": float(args.min_neighbor_pass_fraction),
-        "max_so3_per_center": float(args.max_so3_per_center),
-    }
-    integrity_report_file = (
-        args.integrity_report
-        or os.path.join(args.output_dir, f"{args.tag}-integrity.csv")
-    )
-
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    use_discrete = args.discrete is not None
-    output_file = build_output_filename(args.output_dir, args.tag, use_discrete, args.discrete_cell)
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    print("--- Configuration ---")
+    print("--- Chemistry training configuration ---")
     print(f"Database: {args.database}")
-    print(f"Output CSV: {output_file}")
-    print(f"Species/composition: {species} / {composition}")
-    print(f"Role/SO3 labels: { {s: config[s]['coordination'] for s in species} }")
-    print(f"References: { {s: config[s]['reference'] for s in species} }")
-    print(f"SO3 cutoff: {args.rcut}")
-    print(f"Integrity filter: {integrity}")
-    print(f"Integrity report: {integrity_report_file}")
-    print("---------------------")
+    print(f"Input structures: {len(rows)}")
+    print(f"Building center: {center_species}")
+    print(f"Attachment species: {attachment_species}")
+    print(f"{center_species}->{attachment_species} expected CN: {args.center_attachment_cn}")
+    print(f"{attachment_species}->{center_species} expected CN: {args.attachment_center_cn}")
+    print(f"Broad search radius: {args.r_search:.5f} A")
+    print(f"Maximum peaks/channel: {args.n_peak}")
+    print(f"Sampling width: +/- {args.n_width:.3f} sigma")
+    print(f"Minimum per-structure CN pass fraction: {args.min_cn_pass_fraction:.5f}")
+    print("----------------------------------------")
 
-    filter_by_energy = np.isfinite(args.max_energy)
-    db = database_topology(args.database)
-    xtals = db.get_all_xtals(include_energy=args.energy or filter_by_energy)
-    if filter_by_energy:
-        xtals = [x for x in xtals if getattr(x, "ff_energy", None) is not None and x.ff_energy <= args.max_energy]
-    params = (
-        args.max_dof, 1, args.max_atoms, args.max_energy, args.min_spg,
-        args.max_wp, args.max_per_struc, args.energy, use_discrete,
-        args.discrete_cell, args.discrete if use_discrete else None, 5e-4,
-        config, species, composition, args.rcut, integrity,
-    )
-    worker = partial(process_one_xtal, params=params, base_seed=args.seed)
-    indexed = list(enumerate(xtals))
-    total_reps, integrity_reports, usable, failed = [], [], 0, 0
+    for completed, row in enumerate(rows, start=1):
+        try:
+            structure = AseAtomsAdaptor.get_structure(row.toatoms())
+            symbols = [str(site.specie.symbol) for site in structure]
+            unexpected = sorted(set(symbols) - {center_species, attachment_species})
+            if unexpected:
+                raise ValueError(f"Unexpected species in row {row.id}: {unexpected}")
+            structures.append({"row_id": int(row.id), "structure": structure, "natoms": int(len(structure))})
+        except Exception as exc:
+            failures.append({"row_id": int(row.id), "error": f"{type(exc).__name__}: {exc}"})
+        if completed % args.progress_every == 0 or completed == len(rows):
+            print(f"Loaded {completed}/{len(rows)} structures; valid={len(structures)}; failures={len(failures)}")
 
-    results = map(worker, indexed) if args.ncpu == 1 else None
-    if args.ncpu == 1:
-        iterator = results
-        pool = None
-    else:
-        pool = Pool(processes=args.ncpu)
-        iterator = pool.imap_unordered(worker, indexed, chunksize=args.chunksize)
-    try:
-        for source_index, source_reps, source_reports, error in iterator:
-            integrity_reports.extend(source_reports)
-            if error:
-                failed += 1
-                print(f"Source {source_index} failed: {error}")
+    if not structures:
+        raise RuntimeError("No valid structures were loaded")
+
+    ca_distances = _collect_broad_distances(structures, center_species, attachment_species, args.r_search)
+    ac_distances = _collect_broad_distances(structures, attachment_species, center_species, args.r_search)
+    ca_shell = _learn_shell_cutoff(ca_distances, args.center_attachment_cn, args.r_search,
+                                    args.grid_size, args.shell_smooth_sigma_bins,
+                                    args.shell_peak_prominence_fraction,
+                                    args.shell_valley_fraction,
+                                    args.shell_valley_min_width)
+    ac_shell = _learn_shell_cutoff(ac_distances, args.attachment_center_cn, args.r_search,
+                                    args.grid_size, args.shell_smooth_sigma_bins,
+                                    args.shell_peak_prominence_fraction,
+                                    args.shell_valley_fraction,
+                                    args.shell_valley_min_width)
+    ca_cutoff = float(ca_shell["r_shell_A"])
+    ac_cutoff = float(ac_shell["r_shell_A"])
+
+    structure_records = []
+    center_site_records = []
+    attachment_site_records = []
+    accepted_structures = []
+
+    for completed, entry in enumerate(structures, start=1):
+        structure = entry["structure"]
+        row_id = int(entry["row_id"])
+        symbols = [str(site.specie.symbol) for site in structure]
+        center_ids = [i for i, s in enumerate(symbols) if s == center_species]
+        attachment_ids = [i for i, s in enumerate(symbols) if s == attachment_species]
+        center_passes = []
+        attachment_passes = []
+
+        for local_index, site_id in enumerate(center_ids):
+            neighbors = _species_neighbors(structure, site_id, attachment_species, args.r_search)
+            distances = [n["distance"] for n in neighbors]
+            cn = int(sum(d <= ca_cutoff + EPS for d in distances))
+            passed = cn == args.center_attachment_cn
+            center_passes.append(passed)
+            nth = float(distances[args.center_attachment_cn - 1]) if len(distances) >= args.center_attachment_cn else np.nan
+            nxt = float(distances[args.center_attachment_cn]) if len(distances) > args.center_attachment_cn else np.nan
+            gap = float(nxt - nth) if np.isfinite(nth) and np.isfinite(nxt) else np.nan
+            center_site_records.append({
+                "row_id": row_id, "site_local_index": int(local_index), "atom_index": int(site_id),
+                "species": center_species, "neighbor_species": attachment_species,
+                "expected_cn": int(args.center_attachment_cn), "learned_shell_cutoff_A": ca_cutoff,
+                "observed_cn": cn, "cn_pass": bool(passed), "nth_distance_A": nth,
+                "next_distance_A": nxt, "shell_gap_A": gap,
+                "distances_within_r_search_A": json.dumps([float(x) for x in distances], separators=(",", ":")),
+            })
+
+        for local_index, site_id in enumerate(attachment_ids):
+            neighbors = _species_neighbors(structure, site_id, center_species, args.r_search)
+            distances = [n["distance"] for n in neighbors]
+            cn = int(sum(d <= ac_cutoff + EPS for d in distances))
+            passed = cn == args.attachment_center_cn
+            attachment_passes.append(passed)
+            nth = float(distances[args.attachment_center_cn - 1]) if len(distances) >= args.attachment_center_cn else np.nan
+            nxt = float(distances[args.attachment_center_cn]) if len(distances) > args.attachment_center_cn else np.nan
+            gap = float(nxt - nth) if np.isfinite(nth) and np.isfinite(nxt) else np.nan
+            attachment_site_records.append({
+                "row_id": row_id, "site_local_index": int(local_index), "atom_index": int(site_id),
+                "species": attachment_species, "neighbor_species": center_species,
+                "expected_cn": int(args.attachment_center_cn), "learned_shell_cutoff_A": ac_cutoff,
+                "observed_cn": cn, "cn_pass": bool(passed), "nth_distance_A": nth,
+                "next_distance_A": nxt, "shell_gap_A": gap,
+                "distances_within_r_search_A": json.dumps([float(x) for x in distances], separators=(",", ":")),
+            })
+
+        center_fraction = float(np.mean(center_passes)) if center_passes else 0.0
+        attachment_fraction = float(np.mean(attachment_passes)) if attachment_passes else 0.0
+        accepted = bool(center_fraction + EPS >= args.min_cn_pass_fraction and
+                        attachment_fraction + EPS >= args.min_cn_pass_fraction)
+        reasons = []
+        if center_fraction + EPS < args.min_cn_pass_fraction:
+            reasons.append("center_cn")
+        if attachment_fraction + EPS < args.min_cn_pass_fraction:
+            reasons.append("attachment_cn")
+        structure_records.append({
+            "row_id": row_id, "natoms": int(len(structure)), "n_center": int(len(center_ids)),
+            "n_attachment": int(len(attachment_ids)), "center_cn_pass_fraction": center_fraction,
+            "attachment_cn_pass_fraction": attachment_fraction, "accepted": accepted,
+            "rejection_reason": ";".join(reasons),
+        })
+        if accepted:
+            accepted_structures.append(entry)
+        if completed % args.progress_every == 0 or completed == len(structures):
+            print(f"CN audit {completed}/{len(structures)} structures; accepted={len(accepted_structures)}")
+
+    if not accepted_structures:
+        raise RuntimeError("No structures passed the CN health filter")
+
+    radial_channels = {
+        f"{center_species}-{attachment_species}": WeightedSamples(),
+        f"{attachment_species}-{center_species}": WeightedSamples(),
+        f"{center_species}-{center_species}": WeightedSamples(),
+    }
+    angular_channels = {
+        f"{attachment_species}-{center_species}-{attachment_species}": WeightedSamples(),
+        f"{center_species}-{attachment_species}-{center_species}": WeightedSamples(),
+    }
+    center_neighbor_cache = []
+
+    for completed, entry in enumerate(accepted_structures, start=1):
+        structure = entry["structure"]
+        row_id = int(entry["row_id"])
+        symbols = [str(site.specie.symbol) for site in structure]
+        center_ids = [i for i, s in enumerate(symbols) if s == center_species]
+        attachment_ids = [i for i, s in enumerate(symbols) if s == attachment_species]
+        center_site_weight = 1.0 / len(center_ids) if center_ids else 0.0
+        attachment_site_weight = 1.0 / len(attachment_ids) if attachment_ids else 0.0
+
+        for local_index, site_id in enumerate(center_ids):
+            site_key = f"row{row_id}:{center_species}{local_index}"
+            attachments = [n for n in _species_neighbors(structure, site_id, attachment_species, ca_cutoff)
+                           if n["distance"] <= ca_cutoff + EPS]
+            if len(attachments) != args.center_attachment_cn:
+                raise RuntimeError(f"Final extraction CN mismatch at row {row_id} center {local_index}")
+            radial_channels[f"{center_species}-{attachment_species}"].extend(
+                [n["distance"] for n in attachments], center_site_weight, site_key, row_id)
+            angles = [_angle_deg(attachments[i]["vector"], attachments[j]["vector"])
+                      for i in range(len(attachments)) for j in range(i + 1, len(attachments))]
+            angular_channels[f"{attachment_species}-{center_species}-{attachment_species}"].extend(
+                angles, center_site_weight, site_key, row_id)
+            centers = _species_neighbors(structure, site_id, center_species, args.r_search)
+            radial_channels[f"{center_species}-{center_species}"].extend(
+                [n["distance"] for n in centers], center_site_weight, site_key, row_id)
+            center_neighbor_cache.append({"row_id": row_id, "site_key": site_key, "neighbors": centers})
+
+        for local_index, site_id in enumerate(attachment_ids):
+            site_key = f"row{row_id}:{attachment_species}{local_index}"
+            centers = [n for n in _species_neighbors(structure, site_id, center_species, ac_cutoff)
+                       if n["distance"] <= ac_cutoff + EPS]
+            if len(centers) != args.attachment_center_cn:
+                raise RuntimeError(f"Final extraction CN mismatch at row {row_id} attachment {local_index}")
+            radial_channels[f"{attachment_species}-{center_species}"].extend(
+                [n["distance"] for n in centers], attachment_site_weight, site_key, row_id)
+            angles = [_angle_deg(centers[i]["vector"], centers[j]["vector"])
+                      for i in range(len(centers)) for j in range(i + 1, len(centers))]
+            angular_channels[f"{center_species}-{attachment_species}-{center_species}"].extend(
+                angles, attachment_site_weight, site_key, row_id)
+
+        if completed % args.progress_every == 0 or completed == len(accepted_structures):
+            print(f"Chemistry extraction {completed}/{len(accepted_structures)} accepted structures")
+
+    ca_name = f"{center_species}-{attachment_species}"
+    ac_name = f"{attachment_species}-{center_species}"
+    cc_name = f"{center_species}-{center_species}"
+    aca_name = f"{attachment_species}-{center_species}-{attachment_species}"
+    cac_name = f"{center_species}-{attachment_species}-{center_species}"
+
+    models = {}
+    models[f"radial:{ca_name}"] = _fit_major_gaussian_peaks(
+        radial_channels[ca_name], args.n_peak, (0.0, ca_cutoff), args.grid_size,
+        args.peak_smooth_sigma_bins, args.peak_prominence_fraction, args.n_width)
+    models[f"radial:{ac_name}"] = _fit_major_gaussian_peaks(
+        radial_channels[ac_name], args.n_peak, (0.0, ac_cutoff), args.grid_size,
+        args.peak_smooth_sigma_bins, args.peak_prominence_fraction, args.n_width)
+    models[f"angular:{aca_name}"] = _fit_major_gaussian_peaks(
+        angular_channels[aca_name], args.n_peak, (0.0, 180.0), args.grid_size,
+        args.peak_smooth_sigma_bins, args.peak_prominence_fraction, args.n_width)
+    models[f"angular:{cac_name}"] = _fit_major_gaussian_peaks(
+        angular_channels[cac_name], args.n_peak, (0.0, 180.0), args.grid_size,
+        args.peak_smooth_sigma_bins, args.peak_prominence_fraction, args.n_width)
+    models[f"radial:{cc_name}"] = _fit_major_gaussian_peaks(
+        radial_channels[cc_name], args.n_peak, (0.0, args.r_search), args.grid_size,
+        args.peak_smooth_sigma_bins, args.peak_prominence_fraction, args.n_width,
+        exclude_right_boundary=True)
+
+    cc_peaks = models[f"radial:{cc_name}"]["peaks"]
+    shell_pair_channels = defaultdict(WeightedSamples)
+    if cc_peaks:
+        cc_mus = np.asarray([float(p["mu"]) for p in cc_peaks], dtype=float)
+        per_structure_shell_pair_sites = defaultdict(lambda: defaultdict(list))
+        for entry in center_neighbor_cache:
+            neighbors = entry["neighbors"]
+            if len(neighbors) < 2:
                 continue
-            if not source_reps:
-                continue
-            usable += 1
-            if args.label:
-                source_reps = [np.append(rep, source_index + 1) for rep in source_reps]
-            total_reps.extend(source_reps)
-            print(f"Completed source {source_index}: {len(source_reps)} representations; total={len(total_reps)}")
-    finally:
-        if pool is not None:
-            pool.close(); pool.join()
+            shell_ids = [int(np.argmin(np.abs(cc_mus - n["distance"]))) for n in neighbors]
+            grouped_angles = defaultdict(list)
+            for i in range(len(neighbors)):
+                for j in range(i + 1, len(neighbors)):
+                    pair = tuple(sorted((shell_ids[i], shell_ids[j])))
+                    grouped_angles[pair].append(_angle_deg(neighbors[i]["vector"], neighbors[j]["vector"]))
+            for pair, angles in grouped_angles.items():
+                per_structure_shell_pair_sites[int(entry["row_id"])][pair].append(
+                    (entry["site_key"], angles)
+                )
 
-    if integrity_reports:
-        os.makedirs(os.path.dirname(integrity_report_file) or ".", exist_ok=True)
-        pd.DataFrame(integrity_reports).sort_values(
-            ["source_index", "stage"], kind="stable"
-        ).to_csv(integrity_report_file, index=False)
-        accepted_count = sum(bool(row["accepted"]) for row in integrity_reports)
-        print(
-            f"Integrity checks accepted {accepted_count}/{len(integrity_reports)}; "
-            f"report={integrity_report_file}"
-        )
+        for row_id, pair_map in per_structure_shell_pair_sites.items():
+            for pair, site_entries in pair_map.items():
+                site_weight = 1.0 / len(site_entries)
+                for site_key, angles in site_entries:
+                    shell_pair_channels[pair].extend(
+                        angles, site_weight, site_key, row_id
+                    )
 
-    print(f"Usable source structures: {usable}")
-    print(f"Failed source structures: {failed}")
-    print(f"Total representations: {len(total_reps)}")
-    if total_reps:
-        make_csv(total_reps, args.energy, args.label, use_discrete,
-                 args.discrete_cell, args.max_wp, output_file)
+    for pair, samples in sorted(shell_pair_channels.items()):
+        channel = f"angular:{center_species}-{center_species}-{center_species}:shell_{pair[0]+1}_{pair[1]+1}"
+        models[channel] = _fit_major_gaussian_peaks(
+            samples, args.n_peak, (0.0, 180.0), args.grid_size,
+            args.peak_smooth_sigma_bins, args.peak_prominence_fraction, args.n_width)
+
+    radial_rows = []
+    for channel, samples in radial_channels.items():
+        for value, weight, site_key, source_row in zip(samples.values, samples.weights, samples.site_keys, samples.source_rows):
+            radial_rows.append({"channel": channel, "value_A": float(value), "weight": float(weight),
+                                "site_key": site_key, "row_id": int(source_row)})
+
+    all_angular_channels = dict(angular_channels)
+    for pair, samples in shell_pair_channels.items():
+        all_angular_channels[f"{center_species}-{center_species}-{center_species}:shell_{pair[0]+1}_{pair[1]+1}"] = samples
+    angular_rows = []
+    for channel, samples in all_angular_channels.items():
+        for value, weight, site_key, source_row in zip(samples.values, samples.weights, samples.site_keys, samples.source_rows):
+            angular_rows.append({"channel": channel, "value_deg": float(value), "weight": float(weight),
+                                 "site_key": site_key, "row_id": int(source_row)})
+
+    peak_rows = []
+    for channel, model in models.items():
+        for peak_index, peak in enumerate(model.get("peaks", []), start=1):
+            peak_rows.append({"channel": channel, "peak_index": peak_index, "mu": peak["mu"],
+                              "sigma": peak["sigma"], "weight": peak["weight"],
+                              "peak_height": peak["peak_height"],
+                              "sampling_min": peak["sampling_min"], "sampling_max": peak["sampling_max"],
+                              "assigned_sample_count": peak["assigned_sample_count"],
+                              "assigned_effective_weight": peak["assigned_effective_weight"],
+                              "basin_min": peak["basin_min"], "basin_max": peak["basin_max"],
+                              "prominence": peak["prominence"],
+                              "boundary_truncated": peak["boundary_truncated"]})
+
+    structure_df = pd.DataFrame(structure_records).sort_values("row_id", kind="stable")
+    center_df = pd.DataFrame(center_site_records).sort_values(["row_id", "site_local_index"], kind="stable")
+    attachment_df = pd.DataFrame(attachment_site_records).sort_values(["row_id", "site_local_index"], kind="stable")
+    radial_df = pd.DataFrame(radial_rows)
+    angular_df = pd.DataFrame(angular_rows)
+    peak_df = pd.DataFrame(peak_rows)
+
+    structure_file = output_dir / "structure_summary.csv"
+    center_file = output_dir / "center_sites.csv"
+    attachment_file = output_dir / "attachment_sites.csv"
+    radial_file = output_dir / "radial_samples.csv"
+    angular_file = output_dir / "angular_samples.csv"
+    peak_file = output_dir / "peak_summary.csv"
+    failure_file = output_dir / "load_failures.csv"
+    model_file = output_dir / "chemistry_model.json"
+
+    structure_df.to_csv(structure_file, index=False)
+    center_df.to_csv(center_file, index=False)
+    attachment_df.to_csv(attachment_file, index=False)
+    radial_df.to_csv(radial_file, index=False)
+    angular_df.to_csv(angular_file, index=False)
+    peak_df.to_csv(peak_file, index=False)
+    if failures:
+        pd.DataFrame(failures).to_csv(failure_file, index=False)
+
+    center_cn_counts = Counter(int(v) for v in center_df["observed_cn"])
+    attachment_cn_counts = Counter(int(v) for v in attachment_df["observed_cn"])
+    rejection_counter = Counter()
+    for reason in structure_df.loc[~structure_df["accepted"], "rejection_reason"]:
+        for token in str(reason).split(";"):
+            if token:
+                rejection_counter[token] += 1
+
+    chemistry_model = {
+        "version": 5,
+        "database": os.path.abspath(args.database),
+        "building_center": center_species,
+        "attachment_species": attachment_species,
+        "parameters": {
+            "center_attachment_cn": int(args.center_attachment_cn),
+            "attachment_center_cn": int(args.attachment_center_cn),
+            "r_search_A": float(args.r_search),
+            "n_peak": int(args.n_peak),
+            "n_width_sigma": float(args.n_width),
+            "min_cn_pass_fraction": float(args.min_cn_pass_fraction),
+            "shell_valley_fraction": float(args.shell_valley_fraction),
+            "shell_valley_min_width_A": float(args.shell_valley_min_width),
+        },
+        "shell_learning": {
+            f"{center_species}->{attachment_species}": ca_shell,
+            f"{attachment_species}->{center_species}": ac_shell,
+        },
+        "health_filter": {
+            "input_structures": int(len(structures)),
+            "accepted_structures": int(len(accepted_structures)),
+            "rejected_structures": int(len(structures) - len(accepted_structures)),
+            "rejection_counts_nonexclusive": dict(sorted(rejection_counter.items())),
+            "center_cn_distribution": dict(sorted(center_cn_counts.items())),
+            "attachment_cn_distribution": dict(sorted(attachment_cn_counts.items())),
+            "center_shell_gap_A_stats": _finite_stats(center_df["shell_gap_A"].astype(float).tolist()),
+            "attachment_shell_gap_A_stats": _finite_stats(attachment_df["shell_gap_A"].astype(float).tolist()),
+        },
+        "chemistry_channels": models,
+        "outputs": {
+            "structure_summary": str(structure_file), "center_sites": str(center_file),
+            "attachment_sites": str(attachment_file), "radial_samples": str(radial_file),
+            "angular_samples": str(angular_file), "peak_summary": str(peak_file),
+        },
+    }
+    model_file.write_text(json.dumps(chemistry_model, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+
+    print("\n" + "=" * 60)
+    print("CHEMISTRY LEARNING SUMMARY")
+    print("=" * 60)
+    print(f"Structures analysed             : {len(structures)}")
+    print(f"Load failures                  : {len(failures)}")
+    print(f"Building center                : {center_species}")
+    print(f"Attachment species             : {attachment_species}")
+    print(f"{center_species}->{attachment_species} expected CN             : {args.center_attachment_cn}")
+    print(f"{attachment_species}->{center_species} expected CN             : {args.attachment_center_cn}")
+    print(f"Broad search radius            : {args.r_search:.5f} A")
+    print(f"Maximum peaks/channel          : {args.n_peak}")
+    print(f"Sampling width                 : +/- {args.n_width:.3f} sigma")
+
+    for label, shell, cn_counts, site_df in (
+        (f"{center_species} -> {attachment_species}", ca_shell, center_cn_counts, center_df),
+        (f"{attachment_species} -> {center_species}", ac_shell, attachment_cn_counts, attachment_df),
+    ):
+        print("\n" + "-" * 60)
+        print(f"{label} SHELL IDENTIFICATION")
+        print("-" * 60)
+        print(f"Expected coordination           : {shell['expected_cn']}")
+        print(f"Learned shell cutoff            : {shell['r_shell_A']:.5f} A")
+        print(f"Mean CN at shell cutoff         : {shell['mean_cn_at_shell']:.5f}")
+        print(f"Selection mode                  : {shell['selection_mode']}")
+        print("dCN/dr major peaks:")
+        for index, peak in enumerate(shell["dcn_dr_peaks"], start=1):
+            print(f"  {index:2d}  r={peak['r_A']:.5f} A  prominence={peak['prominence']:.6g}  <CN>={peak['mean_cn_at_r']:.5f}")
+        first_peak = shell["first_peak"]
+        print(f"First radial-density peak       : {first_peak['r_A']:.5f} A")
+        print(f"Low-density threshold dCN/dr    : {first_peak['valley_limit']:.6g}")
+        print("Persistent low-density valleys:")
+        for region in shell["valley_regions"]:
+            marker = " SELECTED" if abs(region["start_r_A"] - shell["r_shell_A"]) < EPS else ""
+            print(
+                f"  [{region['start_r_A']:.5f}, {region['end_r_A']:.5f}] A  "
+                f"width={region['width_A']:.5f} A  "
+                f"persistent={region['persistent']}{marker}"
+            )
+        print(f"Per-site CN distribution       : {dict(sorted(cn_counts.items()))}")
+        valid = int(site_df["cn_pass"].sum())
+        total = int(len(site_df))
+        print(f"CN-valid sites                 : {valid}/{total} ({valid/total:.2%})")
+        gap_stats = _finite_stats(site_df["shell_gap_A"].astype(float).tolist())
+        print("Shell gap q05/q25/q50/q75/q95  : "
+              f"{gap_stats['q05']:.5f} / {gap_stats['q25']:.5f} / {gap_stats['median']:.5f} / "
+              f"{gap_stats['q75']:.5f} / {gap_stats['q95']:.5f} A")
+
+    print("\n" + "=" * 60)
+    print("STRUCTURE HEALTH FILTER")
+    print("=" * 60)
+    print(f"Input structures                : {len(structures)}")
+    print(f"CN pass requirement             : {args.min_cn_pass_fraction:.2%}")
+    print(f"Accepted structures             : {len(accepted_structures)}")
+    print(f"Rejected structures             : {len(structures)-len(accepted_structures)}")
+    print(f"Rejection counts nonexclusive   : {dict(sorted(rejection_counter.items()))}")
+
+    ordered_channels = [
+        (f"radial:{ca_name}", f"{ca_name} RADIAL", "A"),
+        (f"angular:{aca_name}", f"{aca_name} ANGULAR", "deg"),
+        (f"radial:{ac_name}", f"{ac_name} RADIAL", "A"),
+        (f"angular:{cac_name}", f"{cac_name} ANGULAR", "deg"),
+        (f"radial:{cc_name}", f"{cc_name} RADIAL", "A"),
+    ]
+    ordered_channels.extend((channel, channel.replace("angular:", "").upper(), "deg")
+                            for channel in models
+                            if channel.startswith(f"angular:{center_species}-{center_species}-{center_species}:"))
+    for channel, title, unit in ordered_channels:
+        print()
+        for line in _channel_summary_lines(title, models[channel], unit):
+            print(line)
+
+    print("\n" + "=" * 60)
+    print("OUTPUT")
+    print("=" * 60)
+    print(f"Chemistry model                 : {model_file}")
+    print(f"Structure summary               : {structure_file}")
+    print(f"Center-site audit               : {center_file}")
+    print(f"Attachment-site audit           : {attachment_file}")
+    print(f"Raw radial samples              : {radial_file}")
+    print(f"Raw angular samples             : {angular_file}")
+    print(f"Peak summary                    : {peak_file}")
+    if failures:
+        print(f"Load failures                   : {failure_file}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
     main()
-
