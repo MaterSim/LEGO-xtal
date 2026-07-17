@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build a nearest-neighbor prototype chemistry model for Juliette.
+"""Build a hybrid prototype/direct and human-defined molecular chemistry model for Juliette.
 
 Prototype geometry supplies local radial/angular centers. User settings supply
 Gaussian widths. Direct generator species are defined only by nearest-neighbor
 chemistry: target CN, local radial roles, and central-species angular geometry.
-Outer-shell/environment fingerprints are intentionally not extracted here.
+Outer-shell/environment fingerprints are intentionally not extracted here. Linear dimers are defined directly by human-supplied bond and center-exclusion parameters.
 """
 from __future__ import annotations
 
@@ -58,11 +58,12 @@ def extract_prototype(
 ) -> dict:
     structure = Structure.from_file(path)
     observed = sorted({str(site.specie.symbol) for site in structure})
-    if observed != [str(final_element)]:
+    if len(observed) != 1:
         raise ValueError(
-            f"Prototype {path!r} for {label} must contain only {final_element}; "
-            f"observed={observed}"
+            f"Prototype {path!r} for {label} must be elemental so that one "
+            f"well-defined local geometry is extracted; observed={observed}"
         )
+    prototype_element = str(observed[0])
     if cn <= 0:
         raise ValueError(f"Target CN must be positive for {label}")
 
@@ -116,6 +117,7 @@ def extract_prototype(
         "generator_species": str(label),
         "final_element": str(final_element),
         "prototype": str(Path(path).resolve()),
+        "prototype_element": prototype_element,
         "target_local_cn": int(cn),
         "local_radial_slots": [
             {
@@ -135,6 +137,26 @@ def extract_prototype(
         },
     }
 
+
+
+def human_linear_dimer(label: str, final_element: str, bond_mu: float, bond_sigma: float, minimum_center_distance: float) -> dict:
+    if bond_mu <= 0 or bond_sigma <= 0 or minimum_center_distance <= 0:
+        raise ValueError(f"Linear-dimer parameters must be positive for {label}")
+    return {
+        "generator_species": str(label),
+        "final_element": str(final_element),
+        "prototype": None,
+        "construction_role": "molecular_unit",
+        "molecular_unit": {
+            "geometry": "linear_dimer",
+            "physical_atoms_per_center": 2,
+            "bond_mu_A": float(bond_mu),
+            "bond_sigma_A": float(bond_sigma),
+            "minimum_center_distance_A": float(minimum_center_distance),
+            "source": "human_definition",
+        },
+        "source": "human_definition",
+    }
 
 def local_channel(spec_i: dict, spec_j: dict, radial_sigma: float) -> dict:
     self_i = float(spec_i["local_radial_slots"][0]["mu_A"])
@@ -172,10 +194,21 @@ def parse_args() -> argparse.Namespace:
         nargs=4,
         action="append",
         metavar=("CIF", "GENERATOR_SPECIES", "FINAL_ELEMENT", "CN"),
-        required=True,
+        required=False,
         help=(
             "Repeat once per generator species, e.g. "
             "--prototype graphite.cif C_sp2 C 3"
+        ),
+    )
+    parser.add_argument(
+        "--linear-dimer",
+        nargs=5,
+        action="append",
+        default=[],
+        metavar=("GENERATOR_SPECIES", "FINAL_ELEMENT", "BOND_MU_A", "BOND_SIGMA_A", "MIN_CENTER_DISTANCE_A"),
+        help=(
+            "Repeat for a human-defined molecular building center, e.g. "
+            "--linear-dimer N2 N 1.10 0.04 2.0"
         ),
     )
     parser.add_argument("--radial-sigma", type=float, default=0.08)
@@ -195,7 +228,10 @@ def main() -> None:
 
     species = []
     seen = set()
-    for path, label, final_element, cn_text in args.prototype:
+    prototypes = args.prototype or []
+    if not prototypes and not args.linear_dimer:
+        raise ValueError("At least one --prototype or --linear-dimer definition is required")
+    for path, label, final_element, cn_text in prototypes:
         if label in seen:
             raise ValueError(f"Duplicate generator species {label!r}")
         seen.add(label)
@@ -211,19 +247,34 @@ def main() -> None:
             )
         )
 
+    for label, final_element, bond_mu, bond_sigma, min_center in args.linear_dimer:
+        if label in seen:
+            raise ValueError(f"Duplicate generator species {label!r}")
+        seen.add(label)
+        species.append(
+            human_linear_dimer(
+                label=label,
+                final_element=final_element,
+                bond_mu=float(bond_mu),
+                bond_sigma=float(bond_sigma),
+                minimum_center_distance=float(min_center),
+            )
+        )
+
     by_label = {item["generator_species"]: item for item in species}
     labels = sorted(by_label)
     channels = []
-    for i, label_i in enumerate(labels):
-        for label_j in labels[i:]:
+    direct_labels = [label for label in labels if by_label[label].get("construction_role", "direct") == "direct"]
+    for i, label_i in enumerate(direct_labels):
+        for label_j in direct_labels[i:]:
             channels.append(
                 local_channel(by_label[label_i], by_label[label_j], args.radial_sigma)
             )
 
     model = {
-        "version": "prototype_user_v5",
+        "version": "prototype_user_v6",
         "schema": "juliette_constructive_chemistry_v2",
-        "model_type": "prototype_nearest_neighbor_generator_species_chemistry",
+        "model_type": "hybrid_prototype_direct_and_human_molecular_chemistry",
         "parameters": {
             "radial_sigma_A": float(args.radial_sigma),
             "angular_sigma_deg": float(args.angular_sigma),
@@ -233,12 +284,12 @@ def main() -> None:
             item["generator_species"]: item["final_element"] for item in species
         },
         "generator_species": [
-            dict(item, construction_role="direct") for item in species
+            dict(item, construction_role=item.get("construction_role", "direct")) for item in species
         ],
         "chemistry_channels": channels,
         "channel_key": ["species_i", "species_j", "relation_type"],
         "construction_roles": {
-            item["generator_species"]: "direct" for item in species
+            item["generator_species"]: item.get("construction_role", "direct") for item in species
         },
         "local_angular_semantics": "central_generator_species",
         "local_coordination_semantics": (
@@ -273,6 +324,14 @@ def main() -> None:
         )
     print("Central-species nearest-neighbor chemistry:")
     for item in species:
+        if item.get("construction_role", "direct") == "molecular_unit":
+            unit = item["molecular_unit"]
+            print(
+                f"  {item['generator_species']}: molecular_unit={unit['geometry']} "
+                f"bond={unit['bond_mu_A']:.6f} A sigma={unit['bond_sigma_A']:.6f} A "
+                f"minimum_center_distance={unit['minimum_center_distance_A']:.6f} A"
+            )
+            continue
         angles = [
             round(float(slot["mu_deg"]), 6)
             for slot in item["local_angular_slots"]
