@@ -1,5 +1,5 @@
 from pyxtal import pyxtal
-from pyxtal.lego.builder import builder
+from lego.builder import builder
 xtal = pyxtal()
 xtal.from_spg_wps_rep(194, ['2c', '2b'], [2.46, 6.70])
 cif_file = xtal.to_pymatgen()

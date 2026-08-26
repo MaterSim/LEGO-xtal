@@ -2,6 +2,8 @@ import subprocess
 import json
 from time import time
 
+#julia_exe = os.environ["julia"]
+
 # Create Julia script once
 julia_script = """
 using CrystalNets
@@ -43,7 +45,7 @@ with open("process_topology.jl", "w") as f:
     f.write(julia_script)
 
 # Now use it
-cif_file = "test.cif"
+cif_file = "C.cif"
 
 print("Calling Julia subprocess...")
 t0 = time()
@@ -53,7 +55,7 @@ try:
         ["julia", "process_topology.jl", cif_file],
         capture_output=True,
         text=True,
-        timeout=30  # 30 second timeout
+        timeout=600 # 30 second timeout
     )
     
     elapsed = time() - t0
@@ -73,6 +75,6 @@ try:
         print("Julia error:", result.stderr)
         
 except subprocess.TimeoutExpired:
-    print(f"Timeout after 30 seconds!")
+    print(f"Timeout after 600 seconds!")
 except Exception as e:
     print(f"Error: {e}")

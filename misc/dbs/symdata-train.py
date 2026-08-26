@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from pyxtal import pyxtal
 from pyxtal.db import database_topology
-from pyxtal.lego.builder import builder
+from lego.builder import builder
 from pyxtal.util import new_struc_wo_energy
 
 

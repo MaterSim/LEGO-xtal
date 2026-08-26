@@ -434,6 +434,7 @@ class VAE(BaseSynthesizer):
         self.transformer = DataTransformer()
         self.transformer.fit(train_data, discrete_columns)
         train_data = self.transformer.transform(train_data)
+        os.makedirs("data", exist_ok=True)
         np.save("data/train_data.npy", train_data)
         print("Train Data", np.shape(train_data), '\n', train_data[:10])
         print("Transformed Data shape", np.shape(train_data))
