@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import pandas as pd
 from tqdm import tqdm
 import numpy as np
-from pyxtal.lego.builder import builder
+from lego.builder import builder
 from pyxtal.db import database_topology
 from SO3 import SO3
 from batch_sym import Symmetry

@@ -1,0 +1,12 @@
+{
+  "Ti": {
+    "neighbor_species": "O",
+    "coordination": 6,
+    "reference": "rutile.cif"
+  },
+  "O": {
+    "neighbor_species": "Ti",
+    "coordination": 3,
+    "reference": "rutile.cif"
+  }
+}

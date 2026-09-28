@@ -1,4 +1,4 @@
-from pyxtal.lego.builder import builder
+from lego.builder import builder
 from pyxtal import pyxtal
 
 # Get the graphite reference environment and set up optimizer
